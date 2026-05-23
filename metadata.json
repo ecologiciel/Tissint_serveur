@@ -1,0 +1,6 @@
+{
+  "name": "App_meteorite",
+  "description": "Back-end expert d'identification de météorites avec FastAPI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

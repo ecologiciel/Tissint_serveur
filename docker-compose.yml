@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # Base de données PostgreSQL de Production
+  postgres_db:
+    image: postgres:16-alpine
+    container_name: meteorite_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-SecretProductionPassword2026}
+      POSTGRES_DB: ${DB_NAME:-meteorite_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-meteorite_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # API FastAPI (Ton application de diagnostic)
+  api_server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meteorite_api
+    restart: always
+    depends_on:
+      postgres_db:
+        condition: service_healthy # Attend que Postgres soit totalement prêt avant de démarrer l'API
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-SecretProductionPassword2026}@postgres_db:5432/${DB_NAME:-meteorite_db}
+      - STORAGE_DIR=/app/storage_vessel
+    volumes:
+      # Volume persistant pour sécuriser les photos des utilisateurs
+      - meteorite_storage:/app/storage_vessel
+
+volumes:
+  postgres_data: # Sauvegarde les tables et le JSONB
+  meteorite_storage: # Sauvegarde les fichiers images (.jpg)
