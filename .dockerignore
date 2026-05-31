@@ -1,0 +1,14 @@
+.git
+.runtime
+node_modules
+build
+dist
+coverage
+storage_vessel
+__pycache__
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+!.env.example

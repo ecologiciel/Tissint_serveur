@@ -3,10 +3,13 @@ from pydantic import BaseModel
 from typing import List, Optional
 import uuid
 import anyio
+import os
 from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import text
+from fastapi.middleware.cors import CORSMiddleware
 
 from exceptions import AppProductionException, app_exception_handler
 from schemas import ScanMetadataInput, MarketplaceListingResponse, PublicListingItem, CreateMessageInput, MessageResponse
@@ -35,12 +38,38 @@ app = FastAPI(
     description="Back-end expert d'identification avec gestion flexible des flux multimédias",
     lifespan=lifespan
 )
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.add_exception_handler(AppProductionException, app_exception_handler)
 
 # Global initialization of our orchestration blocks
 vision_pipeline = VisionPipeline()
 fusion_engine = MeteoriteFusionEngine()
 business_orchestrator = BusinessOrchestrator()
+
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def healthcheck():
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"database_unavailable: {exc}")
+
+    return {
+        "status": "ok",
+        "service": "tinssit-backend",
+        "database": "ok"
+    }
 
 @app.post("/api/v1/scan/exterior", status_code=status.HTTP_200_OK)
 async def scan_exterior(

@@ -4,5 +4,7 @@ dist/
 coverage/
 .DS_Store
 *.log
+.runtime/
+storage_vessel/
 .env*
 !.env.example

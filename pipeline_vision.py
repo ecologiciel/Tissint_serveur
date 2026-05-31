@@ -60,7 +60,7 @@ class VisionPipeline:
                 raise ValueError("Modèle inconnu")
             
             prob_bin = torch.sigmoid(out_bin).item()
-            prob_sub = torch.softmax(out_sub, dim=1).cpu().squeeze(0).numpy()
+            prob_sub = torch.softmax(out_sub, dim=1).cpu().squeeze(0).numpy().astype(float).tolist()
             
         return {"prob_bin": prob_bin, "prob_sub": prob_sub}
 
@@ -104,15 +104,15 @@ class VisionPipeline:
             "exterior": {
                 "dino": {
                     "prob_bin": float(np.mean(ext_dino_bin)), 
-                    "prob_sub": np.mean(ext_dino_sub, axis=0)
+                    "prob_sub": np.mean(ext_dino_sub, axis=0).astype(float).tolist()
                 },
                 "swin": {
                     "prob_bin": float(np.mean(ext_swin_bin)), 
-                    "prob_sub": np.mean(ext_swin_sub, axis=0)
+                    "prob_sub": np.mean(ext_swin_sub, axis=0).astype(float).tolist()
                 },
                 "convnext": {
                     "prob_bin": float(np.mean(ext_conv_bin)), 
-                    "prob_sub": np.mean(ext_conv_sub, axis=0)
+                    "prob_sub": np.mean(ext_conv_sub, axis=0).astype(float).tolist()
                 }
             },
             "interior": None
