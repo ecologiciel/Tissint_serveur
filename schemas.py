@@ -187,6 +187,61 @@ class AuditLogResponse(BaseModel):
     metadata: Optional[Any] = None
     created_at: str
 
+class BillingCheckoutInput(BaseModel):
+    plan: str = "monthly"
+    provider: str = "mock"
+    return_url: Optional[str] = Field(None, max_length=500)
+
+    @field_validator("plan")
+    @classmethod
+    def validate_plan(cls, value: str) -> str:
+        if value not in {"monthly", "yearly"}:
+            raise ValueError("Plan d'abonnement invalide.")
+        return value
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        provider = value.strip().lower()
+        if provider == "dev":
+            return "mock"
+        if provider not in {"mock", "cmi", "stripe", "wallet", "paypal"}:
+            raise ValueError("Provider de paiement invalide.")
+        return provider
+
+class CheckoutSessionResponse(BaseModel):
+    id: str
+    provider: str
+    checkout_url: Optional[str] = None
+    amount_dh: float
+    currency: str = "MAD"
+    expires_at: Optional[str] = None
+    status: str = "pending"
+
+class SubscriptionResponse(BaseModel):
+    status: str
+    role: str
+    provider: Optional[str] = None
+    plan: Optional[str] = None
+    renews_at: Optional[str] = None
+    cancels_at: Optional[str] = None
+
+class InvoiceResponse(BaseModel):
+    id: str
+    number: str
+    amount_dh: float
+    vat_dh: Optional[float] = None
+    total_dh: float
+    status: str
+    created_at: str
+    download_url: Optional[str] = None
+
+class BillingWebhookResponse(BaseModel):
+    status: str
+    processed: bool
+    event_id: str
+    subscription: Optional[SubscriptionResponse] = None
+
 class CollectionItemResponse(BaseModel):
     id: str
     scan_id: str

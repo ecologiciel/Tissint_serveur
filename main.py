@@ -5,6 +5,8 @@ import uuid
 import anyio
 import os
 import re
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -41,12 +43,31 @@ from schemas import (
     AdminListingActionInput,
     AdminRadarListingResponse,
     AuditLogResponse,
+    BillingCheckoutInput,
+    BillingWebhookResponse,
+    CheckoutSessionResponse,
     CreateMessageInput,
+    InvoiceResponse,
     MessageResponse,
+    SubscriptionResponse,
 )
 from security import create_token, hash_password, hash_token, verify_api_key, verify_password, validate_upload_file
 from app.services.notifier import send_telegram_radar_alert
-from billing import check_scan_quota, decrement_quota, get_or_create_subscription, quota_limit_for_tier
+from billing import (
+    activate_subscription,
+    cancel_subscription,
+    check_scan_quota,
+    checkout_payload,
+    create_checkout_session,
+    create_invoice,
+    decrement_quota,
+    get_or_create_subscription,
+    invoice_payload,
+    normalize_billing_provider,
+    quota_limit_for_tier,
+    refresh_subscription_state,
+    subscription_payload,
+)
 
 # Import of our processing modules
 from pipeline_vision import VisionPipeline
@@ -54,7 +75,21 @@ from fusion_engine import MeteoriteFusionEngine
 from business_logic import BusinessOrchestrator
 
 # Import database and storage components
-from database import engine, Base, get_db, UserModel, AuthSessionModel, ScanModel, ListingModel, CollectionItemModel, MessageModel, AuditLogModel
+from database import (
+    engine,
+    Base,
+    get_db,
+    UserModel,
+    AuthSessionModel,
+    ScanModel,
+    ListingModel,
+    CollectionItemModel,
+    MessageModel,
+    AuditLogModel,
+    BillingCheckoutSessionModel,
+    BillingEventModel,
+    InvoiceModel,
+)
 from storage import storage_provider
 
 @asynccontextmanager
@@ -70,6 +105,15 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("UPDATE listings SET status = 'published' WHERE status = 'available'"))
         await conn.execute(text("UPDATE listings SET status = 'admin_reserved' WHERE status = 'reserved'"))
         await conn.execute(text("UPDATE listings SET status = 'archived' WHERE status = 'inactive'"))
+        await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'none'"))
+        await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS provider VARCHAR"))
+        await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS plan VARCHAR"))
+        await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN DEFAULT FALSE"))
+        await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS subscription_started_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"))
+        await conn.execute(text("UPDATE user_subscriptions SET status = CASE WHEN tier IN ('premium', 'admin') THEN 'active' ELSE 'none' END WHERE status IS NULL"))
+        await conn.execute(text("UPDATE user_subscriptions SET cancel_at_period_end = FALSE WHERE cancel_at_period_end IS NULL"))
+        await conn.execute(text("UPDATE user_subscriptions SET updated_at = NOW() WHERE updated_at IS NULL"))
     yield
 
 app = FastAPI(
@@ -145,23 +189,29 @@ def _normalize_phone(phone: str) -> str:
     return phone.strip()
 
 def _quota_response(subscription) -> QuotaResponse:
-    daily_limit = quota_limit_for_tier(subscription.tier)
-    remaining_today = daily_limit if subscription.tier in {"premium", "admin"} else max(subscription.remaining_tokens, 0)
+    subscription_state = subscription_payload(subscription)
+    role = subscription_state["role"]
+    daily_limit = quota_limit_for_tier(role)
+    remaining_today = daily_limit if role in {"premium", "admin"} else max(subscription.remaining_tokens, 0)
     return QuotaResponse(
-        role=subscription.tier,
+        role=role,
         daily_limit=daily_limit,
         remaining_today=remaining_today,
         resets_at=None,
     )
 
+def _subscription_response(subscription) -> SubscriptionResponse:
+    return SubscriptionResponse(**subscription_payload(subscription))
+
 def _auth_user_response(user: UserModel, subscription) -> AuthUserResponse:
+    subscription_state = subscription_payload(subscription)
     return AuthUserResponse(
         id=user.id,
         first_name=user.first_name,
         last_name=user.last_name,
         phone=user.phone,
         email=user.email,
-        role=subscription.tier,
+        role=subscription_state["role"],
         premium_expires_at=(
             subscription.subscription_expires_at.isoformat()
             if subscription.subscription_expires_at
@@ -434,6 +484,198 @@ async def get_quota_me(
 ):
     subscription = await get_or_create_subscription(user_id, db)
     return _quota_response(subscription)
+
+
+@app.post(
+    "/api/v1/billing/checkout",
+    response_model=CheckoutSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def create_billing_checkout(
+    payload: BillingCheckoutInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    refresh_subscription_state(subscription, user)
+    checkout = await create_checkout_session(
+        user=user,
+        subscription=subscription,
+        provider=payload.provider,
+        plan=payload.plan,
+        return_url=payload.return_url,
+        db=db,
+    )
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="billing_checkout_created",
+        entity_type="checkout_session",
+        entity_id=checkout.id,
+        metadata={
+            "provider": checkout.provider,
+            "plan": checkout.plan,
+            "status": checkout.status,
+            "amount_dh": checkout.amount_dh,
+        },
+    )
+    await db.commit()
+    await db.refresh(checkout)
+    return CheckoutSessionResponse(**checkout_payload(checkout))
+
+
+@app.get(
+    "/api/v1/billing/subscription",
+    response_model=SubscriptionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_billing_subscription(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    refresh_subscription_state(subscription, user)
+    await db.commit()
+    return _subscription_response(subscription)
+
+
+@app.post(
+    "/api/v1/billing/cancel",
+    response_model=SubscriptionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def cancel_billing_subscription(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    await cancel_subscription(user, subscription, db)
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="billing_subscription_cancelled",
+        entity_type="subscription",
+        entity_id=user.id,
+        metadata=subscription_payload(subscription),
+    )
+    await db.commit()
+    return _subscription_response(subscription)
+
+
+@app.get(
+    "/api/v1/billing/invoices",
+    response_model=List[InvoiceResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def list_billing_invoices(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    result = await db.execute(
+        select(InvoiceModel)
+        .where(InvoiceModel.user_id == user.id)
+        .order_by(InvoiceModel.created_at.desc())
+    )
+    return [InvoiceResponse(**invoice_payload(invoice)) for invoice in result.scalars().all()]
+
+
+@app.post(
+    "/api/v1/billing/webhooks/{provider}",
+    response_model=BillingWebhookResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def handle_billing_webhook(
+    provider: str,
+    payload: Optional[dict] = Body(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    payload = payload or {}
+    provider = normalize_billing_provider(provider)
+    event_type = str(payload.get("type") or payload.get("event_type") or "unknown")
+    encoded_payload = json.dumps(payload, sort_keys=True, default=str)
+    event_id = str(payload.get("event_id") or payload.get("id") or hashlib.sha256(encoded_payload.encode("utf-8")).hexdigest())
+
+    existing_event = await db.execute(
+        select(BillingEventModel).where(
+            BillingEventModel.provider == provider,
+            BillingEventModel.event_id == event_id,
+        )
+    )
+    if existing_event.scalar_one_or_none():
+        return BillingWebhookResponse(status="duplicate", processed=False, event_id=event_id)
+
+    checkout_session_id = payload.get("checkout_session_id") or payload.get("session_id")
+    user_id = payload.get("user_id")
+    checkout = None
+    if checkout_session_id:
+        checkout_result = await db.execute(
+            select(BillingCheckoutSessionModel).where(BillingCheckoutSessionModel.id == checkout_session_id)
+        )
+        checkout = checkout_result.scalar_one_or_none()
+        if checkout:
+            user_id = user_id or checkout.user_id
+
+    user = None
+    subscription = None
+    if user_id:
+        user_result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+        user = user_result.scalar_one_or_none()
+        if user:
+            subscription = await get_or_create_subscription(user.id, db)
+
+    if event_type in {"checkout.completed", "invoice.paid", "payment_succeeded", "subscription.activated"}:
+        if not user or not subscription:
+            raise AppProductionException("VALIDATION_ERROR", "Webhook billing sans utilisateur valide.", 400)
+        plan = str(payload.get("plan") or (checkout.plan if checkout else "monthly"))
+        if checkout:
+            checkout.status = "paid"
+            checkout.completed_at = _utc_now()
+            existing_invoice = await db.execute(
+                select(InvoiceModel).where(InvoiceModel.checkout_session_id == checkout.id)
+            )
+            if not existing_invoice.scalar_one_or_none():
+                create_invoice(user.id, checkout, db)
+        await activate_subscription(user, subscription, provider, plan, db)
+    elif event_type in {"subscription.cancelled", "customer.subscription.deleted"}:
+        if not user or not subscription:
+            raise AppProductionException("VALIDATION_ERROR", "Webhook billing sans utilisateur valide.", 400)
+        await cancel_subscription(user, subscription, db)
+    elif event_type in {"invoice.payment_failed", "payment_failed"}:
+        if subscription:
+            subscription.status = "past_due"
+            subscription.updated_at = _utc_now()
+
+    event = BillingEventModel(
+        id=str(uuid.uuid4()),
+        provider=provider,
+        event_id=event_id,
+        event_type=event_type,
+        user_id=user.id if user else None,
+        checkout_session_id=checkout.id if checkout else None,
+        payload=payload,
+        processed_at=_utc_now(),
+    )
+    db.add(event)
+    await db.commit()
+
+    return BillingWebhookResponse(
+        status="processed",
+        processed=True,
+        event_id=event_id,
+        subscription=_subscription_response(subscription) if subscription else None,
+    )
+
 
 def _blur_coordinates(scan: ScanModel):
     safe_lat = round(scan.latitude, 1) if scan.latitude is not None else None

@@ -1,7 +1,7 @@
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, String, Float, Boolean, Integer, DateTime, ForeignKey
+from sqlalchemy import Column, String, Float, Boolean, Integer, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime, timezone
 
@@ -19,6 +19,12 @@ class UserSubscription(Base):
     tier = Column(String, nullable=False, default="free")
     remaining_tokens = Column(Integer, nullable=False, default=5)
     subscription_expires_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="none")
+    provider = Column(String, nullable=True)
+    plan = Column(String, nullable=True)
+    cancel_at_period_end = Column(Boolean, nullable=False, default=False)
+    subscription_started_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 class UserModel(Base):
     __tablename__ = "users"
@@ -109,6 +115,52 @@ class AuditLogModel(Base):
     entity_type = Column(String, index=True, nullable=False)
     entity_id = Column(String, index=True, nullable=False)
     event_metadata = Column("metadata", JSONB, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class BillingCheckoutSessionModel(Base):
+    __tablename__ = "billing_checkout_sessions"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    provider = Column(String, nullable=False)
+    plan = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    amount_dh = Column(Float, nullable=False)
+    currency = Column(String, nullable=False, default="MAD")
+    checkout_url = Column(String, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class InvoiceModel(Base):
+    __tablename__ = "invoices"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    checkout_session_id = Column(String, ForeignKey("billing_checkout_sessions.id"), index=True, nullable=True)
+    provider = Column(String, nullable=False)
+    provider_invoice_id = Column(String, nullable=True)
+    number = Column(String, unique=True, index=True, nullable=False)
+    amount_dh = Column(Float, nullable=False)
+    vat_dh = Column(Float, nullable=False, default=0.0)
+    total_dh = Column(Float, nullable=False)
+    currency = Column(String, nullable=False, default="MAD")
+    status = Column(String, nullable=False, default="paid")
+    download_url = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class BillingEventModel(Base):
+    __tablename__ = "billing_events"
+    __table_args__ = (UniqueConstraint("provider", "event_id", name="uq_billing_event_provider_event"),)
+
+    id = Column(String, primary_key=True, index=True)
+    provider = Column(String, nullable=False)
+    event_id = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=True)
+    checkout_session_id = Column(String, ForeignKey("billing_checkout_sessions.id"), index=True, nullable=True)
+    payload = Column(JSONB, nullable=False, default=dict)
+    processed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 async def get_db():

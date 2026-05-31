@@ -4,13 +4,18 @@ import type {
   AdminRadarListingResponse,
   ApiErrorResponse,
   AuditLogResponse,
+  BillingCheckoutInput,
+  BillingWebhookResponse,
+  CheckoutSessionResponse,
   CreateMessageInput,
   HealthResponse,
+  InvoiceResponse,
   MarketplaceListingResponse,
   MessageResponse,
   PublicListingItem,
   PublishListingInput,
   ScanDecisionResponse,
+  SubscriptionResponse,
 } from './generated/types';
 
 export type TinssitUploadFile =
@@ -147,6 +152,33 @@ export function createTinssitClient(config: TinssitClientConfig) {
 
     listAdminAuditLogs: (limit = 50) =>
       requestJson<AuditLogResponse[]>(`/api/v1/admin/audit?limit=${limit}`),
+
+    createBillingCheckout: (payload: BillingCheckoutInput) =>
+      requestJson<CheckoutSessionResponse>('/api/v1/billing/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+
+    getBillingSubscription: () =>
+      requestJson<SubscriptionResponse>('/api/v1/billing/subscription'),
+
+    cancelBillingSubscription: () =>
+      requestJson<SubscriptionResponse>('/api/v1/billing/cancel', {
+        method: 'POST',
+      }),
+
+    listBillingInvoices: () => requestJson<InvoiceResponse[]>('/api/v1/billing/invoices'),
+
+    sendBillingWebhook: (provider: string, payload: Record<string, unknown>) =>
+      requestJson<BillingWebhookResponse>(
+        `/api/v1/billing/webhooks/${encodeURIComponent(provider)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+      ),
 
     sendChatMessage: (payload: CreateMessageInput) =>
       requestJson<MessageResponse>('/api/v1/marketplace/chat/send', {

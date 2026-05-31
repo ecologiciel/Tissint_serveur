@@ -76,6 +76,19 @@ export type AuthUserResponse = {
   "premium_expires_at"?: string | null;
 };
 
+export type BillingCheckoutInput = {
+  "plan"?: string;
+  "provider"?: string;
+  "return_url"?: string | null;
+};
+
+export type BillingWebhookResponse = {
+  "status": string;
+  "processed": boolean;
+  "event_id": string;
+  "subscription"?: SubscriptionResponse | null;
+};
+
 export type Body_scan_exterior_api_v1_scan_exterior_post = {
   "client_uuid": string;
   "files_exterior": string[];
@@ -89,6 +102,16 @@ export type Body_scan_exterior_api_v1_scan_exterior_post = {
 
 export type Body_scan_interior_update_api_v1_scan__scan_id__interior_patch = {
   "file_interior": string;
+};
+
+export type CheckoutSessionResponse = {
+  "id": string;
+  "provider": string;
+  "checkout_url"?: string | null;
+  "amount_dh": number;
+  "currency"?: string;
+  "expires_at"?: string | null;
+  "status"?: string;
 };
 
 export type CollectionItemResponse = {
@@ -113,6 +136,17 @@ export type HealthResponse = {
   "status": string;
   "service": string;
   "database": string;
+};
+
+export type InvoiceResponse = {
+  "id": string;
+  "number": string;
+  "amount_dh": number;
+  "vat_dh"?: number | null;
+  "total_dh": number;
+  "status": string;
+  "created_at": string;
+  "download_url"?: string | null;
 };
 
 export type LoginInput = {
@@ -234,6 +268,15 @@ export type ScanMetadataApplied = {
   "has_coordinates": boolean;
 };
 
+export type SubscriptionResponse = {
+  "status": string;
+  "role": string;
+  "provider"?: string | null;
+  "plan"?: string | null;
+  "renews_at"?: string | null;
+  "cancels_at"?: string | null;
+};
+
 export type ApiSchemas = {
   "AdminActionResponse": AdminActionResponse;
   "AdminListingActionInput": AdminListingActionInput;
@@ -243,11 +286,15 @@ export type ApiSchemas = {
   "AuditLogResponse": AuditLogResponse;
   "AuthResponse": AuthResponse;
   "AuthUserResponse": AuthUserResponse;
+  "BillingCheckoutInput": BillingCheckoutInput;
+  "BillingWebhookResponse": BillingWebhookResponse;
   "Body_scan_exterior_api_v1_scan_exterior_post": Body_scan_exterior_api_v1_scan_exterior_post;
   "Body_scan_interior_update_api_v1_scan__scan_id__interior_patch": Body_scan_interior_update_api_v1_scan__scan_id__interior_patch;
+  "CheckoutSessionResponse": CheckoutSessionResponse;
   "CollectionItemResponse": CollectionItemResponse;
   "CreateMessageInput": CreateMessageInput;
   "HealthResponse": HealthResponse;
+  "InvoiceResponse": InvoiceResponse;
   "LoginInput": LoginInput;
   "LogoutInput": LogoutInput;
   "MarketplaceListingResponse": MarketplaceListingResponse;
@@ -260,4 +307,5 @@ export type ApiSchemas = {
   "ScanActions": ScanActions;
   "ScanDecisionResponse": ScanDecisionResponse;
   "ScanMetadataApplied": ScanMetadataApplied;
+  "SubscriptionResponse": SubscriptionResponse;
 };

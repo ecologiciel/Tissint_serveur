@@ -70,6 +70,11 @@ Marketplace descriptions and titles must not contain direct phone, email, WhatsA
 | Admin release listing | `POST` JSON `{ reason? }` | `/api/v1/admin/radar/{listing_id}/release` | `AdminActionResponse` |
 | Admin reject listing | `POST` JSON `{ reason? }` | `/api/v1/admin/radar/{listing_id}/reject` | `AdminActionResponse` |
 | Admin audit logs | `GET` | `/api/v1/admin/audit` | `AuditLogResponse[]` |
+| Create checkout | `POST` JSON `{ plan, provider, return_url? }` | `/api/v1/billing/checkout` | `CheckoutSessionResponse` |
+| Subscription source of truth | `GET` | `/api/v1/billing/subscription` | `SubscriptionResponse` |
+| Cancel subscription | `POST` | `/api/v1/billing/cancel` | `SubscriptionResponse` |
+| Invoice history | `GET` | `/api/v1/billing/invoices` | `InvoiceResponse[]` |
+| Billing webhook | `POST` JSON | `/api/v1/billing/webhooks/{provider}` | `BillingWebhookResponse` |
 | Send chat message | `POST` JSON | `/api/v1/marketplace/chat/send` | `MessageResponse` |
 | Chat history | `GET` | `/api/v1/marketplace/chat/history/{conversation_id}` | `MessageResponse[]` |
 
