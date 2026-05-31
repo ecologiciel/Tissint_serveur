@@ -145,6 +145,48 @@ class PublicListingItem(BaseModel):
     contact_lock_reason: Optional[str] = "premium_required"
     contact_locked_until: Optional[str] = None
 
+class AdminRadarListingResponse(BaseModel):
+    listing_id: str
+    scan_id: str
+    status: str
+    dominant_class: str
+    confidence: float
+    meteorite_probability: float
+    price: float
+    price_mode: str = "fixed_total"
+    title: Optional[str] = None
+    description: Optional[str] = None
+    region: Optional[str] = None
+    weight: Optional[float] = None
+    magnetic: Optional[bool] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    is_rare: bool = True
+    hold_until: Optional[str] = None
+    created_at: Optional[str] = None
+    seller_user_id: Optional[str] = None
+    seller_name: Optional[str] = None
+    seller_phone: Optional[str] = None
+    seller_email: Optional[str] = None
+    seller_verified: bool = False
+
+class AdminListingActionInput(BaseModel):
+    reason: Optional[str] = Field(None, max_length=500)
+
+class AdminActionResponse(BaseModel):
+    status: str
+    message: str
+    listing: AdminRadarListingResponse
+
+class AuditLogResponse(BaseModel):
+    id: str
+    actor_user_id: str
+    action: str
+    entity_type: str
+    entity_id: str
+    metadata: Optional[Any] = None
+    created_at: str
+
 class CollectionItemResponse(BaseModel):
     id: str
     scan_id: str

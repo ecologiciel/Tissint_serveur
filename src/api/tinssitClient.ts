@@ -1,5 +1,9 @@
 import type {
+  AdminActionResponse,
+  AdminListingActionInput,
+  AdminRadarListingResponse,
   ApiErrorResponse,
+  AuditLogResponse,
   CreateMessageInput,
   HealthResponse,
   MarketplaceListingResponse,
@@ -22,6 +26,7 @@ export type TinssitClientConfig = {
   baseUrl: string;
   apiKey: string;
   fetchImpl?: typeof fetch;
+  getAccessToken?: () => string | null | undefined | Promise<string | null | undefined>;
 };
 
 export type ScanExteriorRequest = {
@@ -61,6 +66,10 @@ export function createTinssitClient(config: TinssitClientConfig) {
     const headers = new Headers(init.headers);
     if (options.auth !== false) {
       headers.set('X-API-Key', config.apiKey);
+      const accessToken = await config.getAccessToken?.();
+      if (accessToken) {
+        headers.set('Authorization', `Bearer ${accessToken}`);
+      }
     }
 
     const response = await fetcher(`${baseUrl}${path}`, {
@@ -103,6 +112,41 @@ export function createTinssitClient(config: TinssitClientConfig) {
 
     getMarketplaceListings: () =>
       requestJson<PublicListingItem[]>('/api/v1/marketplace/listings'),
+
+    listAdminRadar: () => requestJson<AdminRadarListingResponse[]>('/api/v1/admin/radar'),
+
+    reserveAdminRadarListing: (listingId: string, payload: AdminListingActionInput = {}) =>
+      requestJson<AdminActionResponse>(
+        `/api/v1/admin/radar/${encodeURIComponent(listingId)}/reserve`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+      ),
+
+    releaseAdminRadarListing: (listingId: string, payload: AdminListingActionInput = {}) =>
+      requestJson<AdminActionResponse>(
+        `/api/v1/admin/radar/${encodeURIComponent(listingId)}/release`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+      ),
+
+    rejectAdminRadarListing: (listingId: string, payload: AdminListingActionInput = {}) =>
+      requestJson<AdminActionResponse>(
+        `/api/v1/admin/radar/${encodeURIComponent(listingId)}/reject`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+      ),
+
+    listAdminAuditLogs: (limit = 50) =>
+      requestJson<AuditLogResponse[]>(`/api/v1/admin/audit?limit=${limit}`),
 
     sendChatMessage: (payload: CreateMessageInput) =>
       requestJson<MessageResponse>('/api/v1/marketplace/chat/send', {

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks, Body, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks, Body, Header, Query
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
@@ -37,6 +37,10 @@ from schemas import (
     PublishListingInput,
     MarketplaceListingResponse,
     PublicListingItem,
+    AdminActionResponse,
+    AdminListingActionInput,
+    AdminRadarListingResponse,
+    AuditLogResponse,
     CreateMessageInput,
     MessageResponse,
 )
@@ -50,7 +54,7 @@ from fusion_engine import MeteoriteFusionEngine
 from business_logic import BusinessOrchestrator
 
 # Import database and storage components
-from database import engine, Base, get_db, UserModel, AuthSessionModel, ScanModel, ListingModel, CollectionItemModel, MessageModel
+from database import engine, Base, get_db, UserModel, AuthSessionModel, ScanModel, ListingModel, CollectionItemModel, MessageModel, AuditLogModel
 from storage import storage_provider
 
 @asynccontextmanager
@@ -93,6 +97,7 @@ ERROR_RESPONSES = {
     400: {"model": ApiErrorResponse, "description": "Requete invalide"},
     401: {"model": ApiErrorResponse, "description": "Cle API invalide ou manquante"},
     402: {"model": ApiErrorResponse, "description": "Quota epuise"},
+    403: {"model": ApiErrorResponse, "description": "Acces interdit"},
     404: {"model": ApiErrorResponse, "description": "Ressource introuvable"},
     409: {"model": ApiErrorResponse, "description": "Conflit metier"},
     413: {"model": ApiErrorResponse, "description": "Fichier trop volumineux"},
@@ -238,6 +243,15 @@ async def _optional_auth_context(
     if not authorization:
         return None, None
     user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    return user, subscription
+
+async def _require_admin_context(
+    authorization: Optional[str],
+    db: AsyncSession,
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    if subscription.tier != "admin":
+        raise AppProductionException("FORBIDDEN", "Acces admin requis.", 403)
     return user, subscription
 
 def resolve_user_id(x_user_id: Optional[str] = Header(None)) -> str:
@@ -524,6 +538,68 @@ def _seller_full_name(seller: Optional[UserModel]) -> Optional[str]:
     ).strip()
     return name or None
 
+async def _write_audit_log(
+    db: AsyncSession,
+    actor_user_id: str,
+    action: str,
+    entity_type: str,
+    entity_id: str,
+    metadata: Optional[dict] = None,
+) -> AuditLogModel:
+    log = AuditLogModel(
+        id=str(uuid.uuid4()),
+        actor_user_id=actor_user_id,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        event_metadata=metadata,
+    )
+    db.add(log)
+    return log
+
+def _audit_log_response(log: AuditLogModel) -> AuditLogResponse:
+    return AuditLogResponse(
+        id=log.id,
+        actor_user_id=log.actor_user_id,
+        action=log.action,
+        entity_type=log.entity_type,
+        entity_id=log.entity_id,
+        metadata=log.event_metadata,
+        created_at=log.created_at.isoformat() if log.created_at else "",
+    )
+
+def _admin_radar_listing_response(
+    listing: ListingModel,
+    scan: ScanModel,
+    seller: Optional[UserModel],
+) -> AdminRadarListingResponse:
+    hold_until = _listing_hold_until(listing)
+    return AdminRadarListingResponse(
+        listing_id=listing.id,
+        scan_id=scan.id,
+        status=_effective_listing_status(listing),
+        dominant_class=scan.dominant_class,
+        confidence=scan.class_confidence,
+        meteorite_probability=scan.meteorite_probability,
+        price=listing.price,
+        price_mode=_listing_price_mode(listing),
+        title=listing.title or scan.dominant_class,
+        description=listing.description,
+        region=listing.region,
+        weight=scan.weight,
+        magnetic=scan.magnetic,
+        latitude=scan.latitude,
+        longitude=scan.longitude,
+        is_rare=_is_rare_candidate(scan.dominant_class, scan.class_confidence),
+        hold_until=hold_until.isoformat() if hold_until else None,
+        created_at=listing.created_at.isoformat() if listing.created_at else None,
+        seller_user_id=seller.id if seller else scan.user_id,
+        seller_name=_seller_full_name(seller),
+        seller_phone=seller.phone if seller else None,
+        seller_email=seller.email if seller else None,
+        seller_verified=seller is not None,
+    )
+
 def _public_listing_item(
     listing: ListingModel,
     scan: ScanModel,
@@ -596,6 +672,15 @@ def _collection_item_response(
         main_image_uri=main_image_uri,
         meteorite_probability=scan.meteorite_probability,
     )
+
+async def _sync_collection_status_for_listing(
+    db: AsyncSession,
+    scan: ScanModel,
+    listing: ListingModel,
+) -> None:
+    result = await db.execute(select(CollectionItemModel).where(CollectionItemModel.scan_id == scan.id))
+    for collection in result.scalars().all():
+        collection.status = _collection_status_for_scan(scan, listing)
 
 @app.post(
     "/api/v1/scan/exterior",
@@ -1116,6 +1201,203 @@ async def get_marketplace_listing_detail(
     if _effective_listing_status(listing) not in MARKETPLACE_VISIBLE_STATUSES and viewer_role != "admin":
         raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
     return _public_listing_item(listing, scan, seller, viewer_role)
+
+
+@app.get(
+    "/api/v1/admin/radar",
+    response_model=List[AdminRadarListingResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def list_admin_radar(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_admin_context(authorization, db)
+    query = (
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(
+            ListingModel.status.in_(
+                [
+                    "institutional_hold_24h",
+                    "admin_reserved",
+                    "published",
+                    "rejected",
+                ]
+            )
+        )
+        .order_by(ListingModel.created_at.desc())
+    )
+    result = await db.execute(query)
+    rows = result.all()
+    return [
+        _admin_radar_listing_response(listing, scan, seller)
+        for listing, scan, seller in rows
+        if _is_rare_candidate(scan.dominant_class, scan.class_confidence)
+    ]
+
+
+async def _admin_listing_row(
+    listing_id: str,
+    db: AsyncSession,
+):
+    query = (
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(ListingModel.id == listing_id)
+    )
+    result = await db.execute(query)
+    row = result.first()
+    if not row:
+        raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+    listing, scan, seller = row
+    if not _is_rare_candidate(scan.dominant_class, scan.class_confidence):
+        raise AppProductionException("CONFLICT", "Cette annonce n'est pas une alerte radar.", 409)
+    return listing, scan, seller
+
+
+async def _apply_admin_listing_action(
+    listing_id: str,
+    target_status: str,
+    action: str,
+    success_message: str,
+    payload: Optional[AdminListingActionInput],
+    authorization: Optional[str],
+    db: AsyncSession,
+) -> AdminActionResponse:
+    admin_user, _subscription = await _require_admin_context(authorization, db)
+    listing, scan, seller = await _admin_listing_row(listing_id, db)
+    previous_status = _effective_listing_status(listing)
+
+    if previous_status in {"sold", "archived"}:
+        raise AppProductionException("CONFLICT", "Cette annonce ne peut plus etre modifiee.", 409)
+    if action == "admin_reject_listing" and previous_status == "rejected":
+        raise AppProductionException("CONFLICT", "Cette annonce est deja rejetee.", 409)
+
+    listing.status = target_status
+    await _sync_collection_status_for_listing(db, scan, listing)
+    await _write_audit_log(
+        db,
+        actor_user_id=admin_user.id,
+        action=action,
+        entity_type="listing",
+        entity_id=listing.id,
+        metadata={
+            "scan_id": scan.id,
+            "previous_status": previous_status,
+            "new_status": target_status,
+            "reason": payload.reason if payload else None,
+        },
+    )
+    await db.commit()
+    await db.refresh(listing)
+
+    return AdminActionResponse(
+        status=listing.status,
+        message=success_message,
+        listing=_admin_radar_listing_response(listing, scan, seller),
+    )
+
+
+@app.post(
+    "/api/v1/admin/radar/{listing_id}/reserve",
+    response_model=AdminActionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def reserve_admin_radar_listing(
+    listing_id: str,
+    payload: Optional[AdminListingActionInput] = Body(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    return await _apply_admin_listing_action(
+        listing_id=listing_id,
+        target_status="admin_reserved",
+        action="admin_reserve_listing",
+        success_message="Annonce reservee pour revue admin.",
+        payload=payload,
+        authorization=authorization,
+        db=db,
+    )
+
+
+@app.post(
+    "/api/v1/admin/radar/{listing_id}/release",
+    response_model=AdminActionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def release_admin_radar_listing(
+    listing_id: str,
+    payload: Optional[AdminListingActionInput] = Body(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    return await _apply_admin_listing_action(
+        listing_id=listing_id,
+        target_status="published",
+        action="admin_release_listing",
+        success_message="Annonce publiee depuis le radar admin.",
+        payload=payload,
+        authorization=authorization,
+        db=db,
+    )
+
+
+@app.post(
+    "/api/v1/admin/radar/{listing_id}/reject",
+    response_model=AdminActionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def reject_admin_radar_listing(
+    listing_id: str,
+    payload: Optional[AdminListingActionInput] = Body(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    return await _apply_admin_listing_action(
+        listing_id=listing_id,
+        target_status="rejected",
+        action="admin_reject_listing",
+        success_message="Annonce rejetee par le radar admin.",
+        payload=payload,
+        authorization=authorization,
+        db=db,
+    )
+
+
+@app.get(
+    "/api/v1/admin/audit",
+    response_model=List[AuditLogResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def list_admin_audit_logs(
+    authorization: Optional[str] = Header(None),
+    limit: int = Query(50, ge=1, le=200),
+    entity_type: Optional[str] = Query(None, max_length=80),
+    entity_id: Optional[str] = Query(None, max_length=120),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_admin_context(authorization, db)
+    query = select(AuditLogModel)
+    if entity_type:
+        query = query.where(AuditLogModel.entity_type == entity_type)
+    if entity_id:
+        query = query.where(AuditLogModel.entity_id == entity_id)
+    query = query.order_by(AuditLogModel.created_at.desc()).limit(limit)
+    result = await db.execute(query)
+    return [_audit_log_response(log) for log in result.scalars().all()]
 
 
 @app.post(

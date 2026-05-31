@@ -65,6 +65,11 @@ Marketplace descriptions and titles must not contain direct phone, email, WhatsA
 | Publish scan | `POST` JSON `{ price?, title?, description?, price_mode?, region? }` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
 | Marketplace list | `GET` | `/api/v1/marketplace/listings` | `PublicListingItem[]` |
 | Marketplace detail | `GET` | `/api/v1/marketplace/listings/{listing_id}` | `PublicListingItem` |
+| Admin radar list | `GET` | `/api/v1/admin/radar` | `AdminRadarListingResponse[]` |
+| Admin reserve listing | `POST` JSON `{ reason? }` | `/api/v1/admin/radar/{listing_id}/reserve` | `AdminActionResponse` |
+| Admin release listing | `POST` JSON `{ reason? }` | `/api/v1/admin/radar/{listing_id}/release` | `AdminActionResponse` |
+| Admin reject listing | `POST` JSON `{ reason? }` | `/api/v1/admin/radar/{listing_id}/reject` | `AdminActionResponse` |
+| Admin audit logs | `GET` | `/api/v1/admin/audit` | `AuditLogResponse[]` |
 | Send chat message | `POST` JSON | `/api/v1/marketplace/chat/send` | `MessageResponse` |
 | Chat history | `GET` | `/api/v1/marketplace/chat/history/{conversation_id}` | `MessageResponse[]` |
 

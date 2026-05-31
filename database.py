@@ -100,6 +100,17 @@ class MessageModel(Base):
     text_content = Column(String, nullable=False)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
+class AuditLogModel(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(String, primary_key=True, index=True)
+    actor_user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    action = Column(String, index=True, nullable=False)
+    entity_type = Column(String, index=True, nullable=False)
+    entity_id = Column(String, index=True, nullable=False)
+    event_metadata = Column("metadata", JSONB, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         try:
