@@ -1,5 +1,41 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from typing import Any, Optional
+
+class ApiError(BaseModel):
+    code: str
+    message: str
+    details: Optional[Any] = None
+
+class ApiErrorResponse(BaseModel):
+    status_code: str = "DIAGNOSTIC_FAILED"
+    error: ApiError
+
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    database: str
+
+class ScanActions(BaseModel):
+    add_to_collection: bool
+    enable_marketplace_button: bool
+    invite_interior_cut: bool
+
+class ScanMetadataApplied(BaseModel):
+    weight_provided: bool
+    magnetic_status: Optional[bool] = None
+    has_coordinates: bool
+
+class ScanDecisionResponse(BaseModel):
+    status_code: str
+    is_meteorite: bool
+    meteorite_probability: float
+    dominant_class: str
+    class_confidence: float
+    actions: ScanActions
+    trigger_radar_admin: bool
+    metadata_applied: ScanMetadataApplied
+    scan_id: str
+    is_sync_retry: bool = False
 
 class MarketplaceListingResponse(BaseModel):
     status: str

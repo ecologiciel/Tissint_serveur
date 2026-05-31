@@ -10,9 +10,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from exceptions import AppProductionException, app_exception_handler
-from schemas import ScanMetadataInput, MarketplaceListingResponse, PublicListingItem, CreateMessageInput, MessageResponse
+from exceptions import (
+    AppProductionException,
+    app_exception_handler,
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from schemas import (
+    ApiErrorResponse,
+    HealthResponse,
+    ScanDecisionResponse,
+    ScanMetadataInput,
+    MarketplaceListingResponse,
+    PublicListingItem,
+    CreateMessageInput,
+    MessageResponse,
+)
 from security import verify_api_key, validate_upload_file
 from app.services.notifier import send_telegram_radar_alert
 from billing import check_scan_quota, decrement_quota
@@ -51,13 +67,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_exception_handler(AppProductionException, app_exception_handler)
+app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
+app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+
+ERROR_RESPONSES = {
+    400: {"model": ApiErrorResponse, "description": "Requete invalide"},
+    401: {"model": ApiErrorResponse, "description": "Cle API invalide ou manquante"},
+    402: {"model": ApiErrorResponse, "description": "Quota epuise"},
+    404: {"model": ApiErrorResponse, "description": "Ressource introuvable"},
+    409: {"model": ApiErrorResponse, "description": "Conflit metier"},
+    413: {"model": ApiErrorResponse, "description": "Fichier trop volumineux"},
+    415: {"model": ApiErrorResponse, "description": "Format de fichier non supporte"},
+    422: {"model": ApiErrorResponse, "description": "Erreur de validation"},
+    503: {"model": ApiErrorResponse, "description": "Service indisponible"},
+    500: {"model": ApiErrorResponse, "description": "Erreur interne"},
+}
 
 # Global initialization of our orchestration blocks
-vision_pipeline = VisionPipeline()
+SKIP_MODEL_LOAD = os.getenv("TINSSIT_SKIP_MODEL_LOAD") == "1"
+vision_pipeline = None if SKIP_MODEL_LOAD else VisionPipeline()
 fusion_engine = MeteoriteFusionEngine()
 business_orchestrator = BusinessOrchestrator()
 
-@app.get("/health", status_code=status.HTTP_200_OK)
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    status_code=status.HTTP_200_OK,
+    responses={503: {"model": ApiErrorResponse, "description": "Dependance indisponible"}},
+)
 async def healthcheck():
     try:
         async with engine.connect() as conn:
@@ -71,7 +108,12 @@ async def healthcheck():
         "database": "ok"
     }
 
-@app.post("/api/v1/scan/exterior", status_code=status.HTTP_200_OK)
+@app.post(
+    "/api/v1/scan/exterior",
+    response_model=ScanDecisionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
 async def scan_exterior(
     client_uuid: str = Form(...),
     files_exterior: List[UploadFile] = File(...),
@@ -153,6 +195,9 @@ async def scan_exterior(
     else:
         print("🔍 Analyse basée uniquement sur les caractéristiques extérieures.")
 
+    if vision_pipeline is None:
+        raise AppProductionException("SERVICE_UNAVAILABLE", "Pipeline IA indisponible.", 503)
+
     try:
         # 2. Pipeline de Vision (Inférence des modèles sur Thread)
         vision_results = await anyio.to_thread.run_sync(
@@ -207,7 +252,12 @@ async def scan_exterior(
 
     return final_decision
 
-@app.patch("/api/v1/scan/{scan_id}/interior", status_code=status.HTTP_200_OK)
+@app.patch(
+    "/api/v1/scan/{scan_id}/interior",
+    response_model=ScanDecisionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
 async def scan_interior_update(
     scan_id: str,
     file_interior: UploadFile = File(...),
@@ -222,12 +272,15 @@ async def scan_interior_update(
         raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
         
     if scan.interior_image_path:
-        raise AppProductionException("CONFLICT", "Une image de coupe existe déjà pour ce scan.", 400)
+        raise AppProductionException("CONFLICT", "Une image de coupe existe déjà pour ce scan.", 409)
 
     # 2. Lecture et Sauvegarde de la nouvelle image de coupe asynchrone
     await validate_upload_file(file_interior)
     interior_bytes = await file_interior.read()
     interior_path = await storage_provider.save_image(interior_bytes, category="interior")
+
+    if vision_pipeline is None:
+        raise AppProductionException("SERVICE_UNAVAILABLE", "Pipeline IA indisponible.", 503)
 
     try:
         # 3. Inférence vision sur la coupe intérieure
@@ -268,7 +321,12 @@ async def scan_interior_update(
     
     return final_decision
 
-@app.post("/api/v1/marketplace/publish/{scan_id}", response_model=MarketplaceListingResponse, status_code=status.HTTP_200_OK)
+@app.post(
+    "/api/v1/marketplace/publish/{scan_id}",
+    response_model=MarketplaceListingResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
 async def publish_to_marketplace(
     scan_id: str,
     background_tasks: BackgroundTasks,
@@ -322,7 +380,12 @@ async def publish_to_marketplace(
     )
 
 
-@app.get("/api/v1/marketplace/listings", response_model=List[PublicListingItem], status_code=status.HTTP_200_OK)
+@app.get(
+    "/api/v1/marketplace/listings",
+    response_model=List[PublicListingItem],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
 async def get_marketplace_listings(
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key)
@@ -356,7 +419,12 @@ async def get_marketplace_listings(
     return listings
 
 
-@app.post("/api/v1/marketplace/chat/send", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/api/v1/marketplace/chat/send",
+    response_model=MessageResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
 async def send_chat_message(
     payload: CreateMessageInput,
     db: AsyncSession = Depends(get_db),
@@ -387,7 +455,12 @@ async def send_chat_message(
     )
 
 
-@app.get("/api/v1/marketplace/chat/history/{conversation_id}", response_model=List[MessageResponse], status_code=status.HTTP_200_OK)
+@app.get(
+    "/api/v1/marketplace/chat/history/{conversation_id}",
+    response_model=List[MessageResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
 async def get_chat_history(
     conversation_id: str,
     db: AsyncSession = Depends(get_db),
