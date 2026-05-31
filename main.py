@@ -4,6 +4,7 @@ from typing import List, Optional
 import uuid
 import anyio
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -57,6 +58,14 @@ async def lifespan(app: FastAPI):
     # Lifecycle: Initialize database schema at startup if needed
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE listings ADD COLUMN IF NOT EXISTS title VARCHAR"))
+        await conn.execute(text("ALTER TABLE listings ADD COLUMN IF NOT EXISTS description VARCHAR"))
+        await conn.execute(text("ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_mode VARCHAR DEFAULT 'fixed_total'"))
+        await conn.execute(text("ALTER TABLE listings ADD COLUMN IF NOT EXISTS region VARCHAR"))
+        await conn.execute(text("UPDATE listings SET price_mode = 'fixed_total' WHERE price_mode IS NULL"))
+        await conn.execute(text("UPDATE listings SET status = 'published' WHERE status = 'available'"))
+        await conn.execute(text("UPDATE listings SET status = 'admin_reserved' WHERE status = 'reserved'"))
+        await conn.execute(text("UPDATE listings SET status = 'archived' WHERE status = 'inactive'"))
     yield
 
 app = FastAPI(
@@ -221,6 +230,15 @@ async def _current_auth_context(
 
     subscription = await get_or_create_subscription(user.id, db)
     return user, session, subscription, token
+
+async def _optional_auth_context(
+    authorization: Optional[str],
+    db: AsyncSession,
+):
+    if not authorization:
+        return None, None
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    return user, subscription
 
 def resolve_user_id(x_user_id: Optional[str] = Header(None)) -> str:
     user_id = (x_user_id or "anonymous").strip()
@@ -412,30 +430,143 @@ def _is_rare_candidate(dominant_class: str, confidence: float) -> bool:
     rare_classes = ["Achondrite", "Carbonee", "Martian", "Lunar", "Pallasite", "Iron", "Metallique"]
     return dominant_class in rare_classes and confidence >= 0.85
 
-def _public_listing_item(listing: ListingModel, scan: ScanModel) -> PublicListingItem:
+MARKETPLACE_VISIBLE_STATUSES = {
+    "published",
+    "institutional_hold_24h",
+    "admin_reserved",
+    "sold",
+}
+MARKETPLACE_LOCKED_FOR_SELLER_STATUSES = {
+    "admin_reserved",
+    "sold",
+    "rejected",
+    "archived",
+}
+CONTACT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+CONTACT_PHONE_RE = re.compile(r"(?:\+?\d[\s().-]?){8,}")
+CONTACT_WHATSAPP_RE = re.compile(
+    r"(whatsapp|wsp|wa\.me|\u0648\u0627\u062a\u0633\u0627\u0628|\u0648\u0627\u062a\u0633)",
+    re.IGNORECASE,
+)
+
+def _clean_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+def _contains_contact_leak(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    return any(
+        pattern.search(value)
+        for pattern in (CONTACT_EMAIL_RE, CONTACT_PHONE_RE, CONTACT_WHATSAPP_RE)
+    )
+
+def _legacy_listing_status(status_value: Optional[str]) -> str:
+    legacy = {
+        "available": "published",
+        "reserved": "admin_reserved",
+        "inactive": "archived",
+    }
+    return legacy.get(status_value or "draft", status_value or "draft")
+
+def _listing_hold_until(listing: ListingModel) -> Optional[datetime]:
+    if _legacy_listing_status(listing.status) != "institutional_hold_24h" or not listing.created_at:
+        return None
+    hold_until = listing.created_at + timedelta(hours=24)
+    return hold_until if hold_until > _utc_now() else None
+
+def _effective_listing_status(listing: ListingModel) -> str:
+    status_value = _legacy_listing_status(listing.status)
+    if status_value == "institutional_hold_24h" and _listing_hold_until(listing) is None:
+        return "published"
+    return status_value
+
+def _marketplace_status_for_publish(scan: ScanModel, is_rare: bool) -> str:
+    return "institutional_hold_24h" if is_rare else "published"
+
+def _listing_price_mode(listing: ListingModel) -> str:
+    if listing.price_mode:
+        return listing.price_mode
+    return "on_request" if listing.price <= 0 else "fixed_total"
+
+def _can_contact_listing(viewer_role: str, status_value: str) -> bool:
+    if status_value == "institutional_hold_24h":
+        return viewer_role == "admin"
+    if status_value in {"published", "admin_reserved"}:
+        return viewer_role in {"premium", "admin"}
+    return False
+
+def _contact_lock_reason(viewer_role: str, status_value: str) -> Optional[str]:
+    if _can_contact_listing(viewer_role, status_value):
+        return None
+    if status_value == "institutional_hold_24h":
+        return "institutional_hold_24h"
+    if status_value in {"sold", "rejected", "archived"}:
+        return "listing_unavailable"
+    if viewer_role not in {"premium", "admin"}:
+        return "premium_required"
+    return "contact_locked"
+
+def _seller_masked_name(seller: Optional[UserModel]) -> str:
+    if not seller:
+        return "Vendeur Tissint"
+    first_name = _clean_optional_text(seller.first_name) or "Vendeur"
+    last_initial = (_clean_optional_text(seller.last_name) or "")[:1]
+    return f"{first_name} {last_initial}.".strip()
+
+def _seller_full_name(seller: Optional[UserModel]) -> Optional[str]:
+    if not seller:
+        return None
+    name = " ".join(
+        part for part in [seller.first_name, seller.last_name] if _clean_optional_text(part)
+    ).strip()
+    return name or None
+
+def _public_listing_item(
+    listing: ListingModel,
+    scan: ScanModel,
+    seller: Optional[UserModel] = None,
+    viewer_role: str = "guest",
+) -> PublicListingItem:
     safe_lat, safe_lon = _blur_coordinates(scan)
+    status_value = _effective_listing_status(listing)
+    can_contact = _can_contact_listing(viewer_role, status_value)
+    contact_locked_until = _listing_hold_until(listing)
+    seller_phone = seller.phone if seller and can_contact else None
     return PublicListingItem(
         listing_id=listing.id,
         scan_id=scan.id,
         price=listing.price,
-        status=listing.status,
+        status=status_value,
         dominant_class=scan.dominant_class,
         confidence=scan.class_confidence,
         weight=scan.weight,
         blurred_latitude=safe_lat,
         blurred_longitude=safe_lon,
         is_rare=_is_rare_candidate(scan.dominant_class, scan.class_confidence),
-        price_mode="on_request" if listing.price <= 0 else "fixed_total",
+        price_mode=_listing_price_mode(listing),
         created_at=listing.created_at.isoformat() if listing.created_at else None,
-        can_contact=False,
-        contact_lock_reason="premium_required",
+        title=listing.title or scan.dominant_class,
+        description=listing.description,
+        region=listing.region,
+        seller_masked_name=_seller_masked_name(seller),
+        seller_name=_seller_full_name(seller) if can_contact else None,
+        seller_phone=seller_phone,
+        seller_whatsapp=seller_phone,
+        seller_verified=seller is not None,
+        can_contact=can_contact,
+        contact_lock_reason=_contact_lock_reason(viewer_role, status_value),
+        contact_locked_until=contact_locked_until.isoformat() if contact_locked_until else None,
     )
 
 def _collection_status_for_scan(scan: ScanModel, listing: Optional[ListingModel] = None) -> str:
     if listing:
-        if listing.status == "sold":
+        status_value = _effective_listing_status(listing)
+        if status_value == "sold":
             return "sold"
-        if listing.status in {"available", "reserved"}:
+        if status_value in {"published", "institutional_hold_24h", "admin_reserved"}:
             return "listed"
     if scan.status_code == "DIAGNOSTIC_SUCCESS_HIGH":
         return "eligible"
@@ -795,6 +926,7 @@ async def publish_to_marketplace(
     scan_id: str,
     background_tasks: BackgroundTasks,
     payload: Optional[PublishListingInput] = Body(None),
+    authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key)
 ):
@@ -802,11 +934,28 @@ async def publish_to_marketplace(
     Route de mise en vente sur le Marketplace ou validation finale.
     Sécurise la vie privée via floutage des coordonnées.
     """
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    payload = payload or PublishListingInput()
+
     result = await db.execute(select(ScanModel).where(ScanModel.id == scan_id))
     scan = result.scalar_one_or_none()
 
     if not scan:
         raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
+    if scan.user_id != user.id:
+        raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
+    if scan.status_code != "DIAGNOSTIC_SUCCESS_HIGH":
+        raise AppProductionException("CONFLICT", "Ce scan n'est pas eligible au marketplace.", 409)
+
+    title = _clean_optional_text(payload.title)
+    description = _clean_optional_text(payload.description)
+    region = _clean_optional_text(payload.region)
+    if _contains_contact_leak(title) or _contains_contact_leak(description):
+        raise AppProductionException(
+            "CONTACT_LEAK_DETECTED",
+            "La description contient des coordonnees directes.",
+            400,
+        )
 
     # Extraction des valeurs de notre BDD
     dominant_class = scan.dominant_class
@@ -815,7 +964,40 @@ async def publish_to_marketplace(
 
     # Le Déclencheur Strict pour le bot Telegram
     is_rare = _is_rare_candidate(dominant_class, confidence)
-    if is_rare:
+    target_status = _marketplace_status_for_publish(scan, is_rare)
+
+    listing_price = payload.price if payload.price is not None else 0.0
+    listing_result = await db.execute(select(ListingModel).where(ListingModel.scan_id == scan_id))
+    listing = listing_result.scalar_one_or_none()
+    previous_status = _legacy_listing_status(listing.status) if listing else None
+
+    if listing:
+        if previous_status in MARKETPLACE_LOCKED_FOR_SELLER_STATUSES:
+            raise AppProductionException("CONFLICT", "Cette annonce ne peut plus etre modifiee.", 409)
+        listing.status = target_status
+        if payload.price is not None:
+            listing.price = listing_price
+        if title is not None:
+            listing.title = title
+        if payload.description is not None:
+            listing.description = description
+        if payload.region is not None:
+            listing.region = region
+        listing.price_mode = payload.price_mode
+    else:
+        listing = ListingModel(
+            id=str(uuid.uuid4()),
+            scan_id=scan_id,
+            price=listing_price,
+            status=target_status,
+            title=title or dominant_class,
+            description=description,
+            price_mode=payload.price_mode,
+            region=region,
+        )
+        db.add(listing)
+
+    if is_rare and previous_status != target_status:
         background_tasks.add_task(
             send_telegram_radar_alert,
             scan_id=scan_id,
@@ -824,27 +1006,22 @@ async def publish_to_marketplace(
             user_id=user_id
         )
 
-    listing_price = payload.price if payload and payload.price is not None else 0.0
-    listing_result = await db.execute(select(ListingModel).where(ListingModel.scan_id == scan_id))
-    listing = listing_result.scalar_one_or_none()
-    if listing:
-        listing.status = "available"
-        if payload and payload.price is not None:
-            listing.price = listing_price
-    else:
-        listing = ListingModel(
-            id=str(uuid.uuid4()),
-            scan_id=scan_id,
-            price=listing_price,
-            status="available"
+    collection_result = await db.execute(
+        select(CollectionItemModel).where(
+            CollectionItemModel.user_id == user.id,
+            CollectionItemModel.scan_id == scan_id,
         )
-        db.add(listing)
+    )
+    collection = collection_result.scalar_one_or_none()
+    if collection:
+        collection.status = _collection_status_for_scan(scan, listing)
 
     await db.commit()
     await db.refresh(listing)
 
     # Security: Anonymisation & Floutage (Arrondi d'une décimale pour une précision régionale protectrice d'environ ~11km)
     safe_lat, safe_lon = _blur_coordinates(scan)
+    contact_locked_until = _listing_hold_until(listing)
 
     return MarketplaceListingResponse(
         status=listing.status,
@@ -855,10 +1032,15 @@ async def publish_to_marketplace(
         dominant_class=dominant_class,
         confidence=confidence,
         price=listing.price,
+        price_mode=_listing_price_mode(listing),
+        title=listing.title,
+        description=listing.description,
+        region=listing.region,
         weight=scan.weight,
         magnetic=scan.magnetic,
         blurred_latitude=safe_lat,
-        blurred_longitude=safe_lon
+        blurred_longitude=safe_lon,
+        contact_locked_until=contact_locked_until.isoformat() if contact_locked_until else None,
     )
 
 
@@ -869,6 +1051,7 @@ async def publish_to_marketplace(
     responses=ERROR_RESPONSES,
 )
 async def get_marketplace_listings(
+    authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key)
 ):
@@ -876,12 +1059,29 @@ async def get_marketplace_listings(
     Récupère toutes les annonces disponibles sur le Marketplace.
     Les coordonnées géospatiales sont anonymisées à 1 décimale (~ 11km).
     """
+    _viewer_user, viewer_subscription = await _optional_auth_context(authorization, db)
+    viewer_role = viewer_subscription.tier if viewer_subscription else "guest"
+
     # Requires an inner join with the scans table to retrieve dominant classes, weight, lat/long etc
-    query = select(ListingModel, ScanModel).join(ScanModel, ListingModel.scan_id == ScanModel.id).where(ListingModel.status == "available")
+    query = (
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(
+            ListingModel.status.in_(
+                list(MARKETPLACE_VISIBLE_STATUSES | {"available", "reserved"})
+            )
+        )
+        .order_by(ListingModel.created_at.desc())
+    )
     result = await db.execute(query)
     rows = result.all()
 
-    listings = [_public_listing_item(listing, scan) for listing, scan in rows]
+    listings = [
+        _public_listing_item(listing, scan, seller, viewer_role)
+        for listing, scan, seller in rows
+        if _effective_listing_status(listing) in MARKETPLACE_VISIBLE_STATUSES
+    ]
         
     return listings
 
@@ -894,18 +1094,28 @@ async def get_marketplace_listings(
 )
 async def get_marketplace_listing_detail(
     listing_id: str,
+    authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key)
 ):
-    query = select(ListingModel, ScanModel).join(ScanModel, ListingModel.scan_id == ScanModel.id).where(ListingModel.id == listing_id)
+    _viewer_user, viewer_subscription = await _optional_auth_context(authorization, db)
+    viewer_role = viewer_subscription.tier if viewer_subscription else "guest"
+    query = (
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(ListingModel.id == listing_id)
+    )
     result = await db.execute(query)
     row = result.first()
 
     if not row:
         raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
 
-    listing, scan = row
-    return _public_listing_item(listing, scan)
+    listing, scan, seller = row
+    if _effective_listing_status(listing) not in MARKETPLACE_VISIBLE_STATUSES and viewer_role != "admin":
+        raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+    return _public_listing_item(listing, scan, seller, viewer_role)
 
 
 @app.post(

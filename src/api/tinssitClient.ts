@@ -5,6 +5,7 @@ import type {
   MarketplaceListingResponse,
   MessageResponse,
   PublicListingItem,
+  PublishListingInput,
   ScanDecisionResponse,
 } from './generated/types';
 
@@ -90,10 +91,14 @@ export function createTinssitClient(config: TinssitClientConfig) {
         body: buildSingleFileFormData('file_interior', fileInterior),
       }),
 
-    publishScanToMarketplace: (scanId: string) =>
+    publishScanToMarketplace: (scanId: string, payload: PublishListingInput = {}) =>
       requestJson<MarketplaceListingResponse>(
         `/api/v1/marketplace/publish/${encodeURIComponent(scanId)}`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
       ),
 
     getMarketplaceListings: () =>

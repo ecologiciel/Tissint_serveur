@@ -74,7 +74,11 @@ class ListingModel(Base):
     id = Column(String, primary_key=True, index=True)
     scan_id = Column(String, ForeignKey("scans.id"), index=True, nullable=False)
     price = Column(Float, nullable=False)
-    status = Column(String, nullable=False, default="available") # available, reserved, sold
+    status = Column(String, nullable=False, default="draft")
+    title = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+    price_mode = Column(String, nullable=False, default="fixed_total")
+    region = Column(String, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 class CollectionItemModel(Base):

@@ -88,10 +88,15 @@ export type MarketplaceListingResponse = {
   "dominant_class": string;
   "confidence": number;
   "price": number;
+  "price_mode"?: string;
+  "title"?: string | null;
+  "description"?: string | null;
+  "region"?: string | null;
   "weight"?: number | null;
   "magnetic"?: boolean | null;
   "blurred_latitude"?: number | null;
   "blurred_longitude"?: number | null;
+  "contact_locked_until"?: string | null;
 };
 
 export type MessageResponse = {
@@ -116,12 +121,25 @@ export type PublicListingItem = {
   "is_rare"?: boolean;
   "price_mode"?: string;
   "created_at"?: string | null;
+  "title"?: string | null;
+  "description"?: string | null;
+  "region"?: string | null;
+  "seller_masked_name"?: string | null;
+  "seller_name"?: string | null;
+  "seller_phone"?: string | null;
+  "seller_whatsapp"?: string | null;
+  "seller_verified"?: boolean;
   "can_contact"?: boolean;
   "contact_lock_reason"?: string | null;
+  "contact_locked_until"?: string | null;
 };
 
 export type PublishListingInput = {
   "price"?: number | null;
+  "title"?: string | null;
+  "description"?: string | null;
+  "price_mode"?: string;
+  "region"?: string | null;
 };
 
 export type QuotaResponse = {

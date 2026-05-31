@@ -44,6 +44,8 @@ Every handled API error returns:
 
 The mobile app should branch on `error.code`, not on translated `message`.
 
+Marketplace descriptions and titles must not contain direct phone, email, WhatsApp, or external contact handles. The server rejects those payloads with `CONTACT_LEAK_DETECTED` so premium/admin contact visibility remains the source of truth.
+
 ## Endpoints
 
 | Mobile flow | Method | Path | Response type |
@@ -60,7 +62,7 @@ The mobile app should branch on `error.code`, not on translated `message`.
 | Collection list | `GET` | `/api/v1/collection` | `CollectionItemResponse[]` |
 | Add scan to collection | `POST` | `/api/v1/collection/{scan_id}` | `CollectionItemResponse` |
 | Collection detail | `GET` | `/api/v1/collection/{scan_id}` | `CollectionItemResponse` |
-| Publish scan | `POST` JSON `{ price? }` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
+| Publish scan | `POST` JSON `{ price?, title?, description?, price_mode?, region? }` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
 | Marketplace list | `GET` | `/api/v1/marketplace/listings` | `PublicListingItem[]` |
 | Marketplace detail | `GET` | `/api/v1/marketplace/listings/{listing_id}` | `PublicListingItem` |
 | Send chat message | `POST` JSON | `/api/v1/marketplace/chat/send` | `MessageResponse` |

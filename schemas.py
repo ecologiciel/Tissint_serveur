@@ -88,6 +88,18 @@ class ScanDecisionResponse(BaseModel):
 
 class PublishListingInput(BaseModel):
     price: Optional[float] = Field(None, ge=0.0)
+    title: Optional[str] = Field(None, min_length=1, max_length=120)
+    description: Optional[str] = Field(None, max_length=1000)
+    price_mode: str = "fixed_total"
+    region: Optional[str] = Field(None, min_length=1, max_length=120)
+
+    @field_validator("price_mode")
+    @classmethod
+    def validate_price_mode(cls, value: str) -> str:
+        allowed = {"fixed_total", "price_per_gram", "negotiable", "on_request"}
+        if value not in allowed:
+            raise ValueError("Mode de prix invalide.")
+        return value
 
 class MarketplaceListingResponse(BaseModel):
     status: str
@@ -98,10 +110,15 @@ class MarketplaceListingResponse(BaseModel):
     dominant_class: str
     confidence: float
     price: float
+    price_mode: str = "fixed_total"
+    title: Optional[str] = None
+    description: Optional[str] = None
+    region: Optional[str] = None
     weight: Optional[float] = None
     magnetic: Optional[bool] = None
     blurred_latitude: Optional[float] = Field(None, description="Latitude floutée pour anonymisation (précision ~11km)")
     blurred_longitude: Optional[float] = Field(None, description="Longitude floutée pour anonymisation (précision ~11km)")
+    contact_locked_until: Optional[str] = None
 
 class PublicListingItem(BaseModel):
     listing_id: str
@@ -116,8 +133,17 @@ class PublicListingItem(BaseModel):
     is_rare: bool = False
     price_mode: str = "on_request"
     created_at: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    region: Optional[str] = None
+    seller_masked_name: Optional[str] = None
+    seller_name: Optional[str] = None
+    seller_phone: Optional[str] = None
+    seller_whatsapp: Optional[str] = None
+    seller_verified: bool = False
     can_contact: bool = False
     contact_lock_reason: Optional[str] = "premium_required"
+    contact_locked_until: Optional[str] = None
 
 class CollectionItemResponse(BaseModel):
     id: str
