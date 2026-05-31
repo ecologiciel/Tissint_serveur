@@ -17,8 +17,33 @@ class UserSubscription(Base):
     
     user_id = Column(String, primary_key=True, index=True)
     tier = Column(String, nullable=False, default="free")
-    remaining_tokens = Column(Integer, nullable=False, default=3)
+    remaining_tokens = Column(Integer, nullable=False, default=5)
     subscription_expires_at = Column(DateTime, nullable=True)
+
+class UserModel(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, index=True)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    phone = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=True)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False, default="free")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class AuthSessionModel(Base):
+    __tablename__ = "auth_sessions"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    device_id = Column(String, nullable=True)
+    access_token_hash = Column(String, unique=True, index=True, nullable=False)
+    refresh_token_hash = Column(String, unique=True, index=True, nullable=False)
+    access_expires_at = Column(DateTime, nullable=False)
+    refresh_expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 class ScanModel(Base):
     __tablename__ = "scans"

@@ -1,12 +1,46 @@
 import os
+import hashlib
+import hmac
+import secrets
 from fastapi import Header, UploadFile
-from typing import List
 from exceptions import AppProductionException
 
 # Clé API de production (idéalement définie dans l'environnement)
 EXPECTED_API_KEY = os.getenv("API_KEY", "meteorite_secret_prod_key_2026")
 MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 Mo
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
+PASSWORD_HASH_ITERATIONS = 260_000
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    ).hex()
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt}${digest}"
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt, expected_digest = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(iterations),
+        ).hex()
+        return hmac.compare_digest(digest, expected_digest)
+    except Exception:
+        return False
+
+def create_token() -> str:
+    return secrets.token_urlsafe(48)
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 async def verify_api_key(x_api_key: str = Header(...)) -> str:
     """

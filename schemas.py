@@ -21,6 +21,49 @@ class QuotaResponse(BaseModel):
     remaining_today: int
     resets_at: Optional[str] = None
 
+class LoginInput(BaseModel):
+    phone_or_email: str = Field(..., min_length=3, max_length=120)
+    password: str = Field(..., min_length=6, max_length=200)
+    device_id: Optional[str] = Field(None, max_length=150)
+
+class RegisterInput(BaseModel):
+    first_name: str = Field(..., min_length=1, max_length=80)
+    last_name: str = Field(..., min_length=1, max_length=80)
+    phone: str = Field(..., min_length=5, max_length=40)
+    email: Optional[str] = Field(None, max_length=120)
+    password: str = Field(..., min_length=6, max_length=200)
+    desired_role: str = "free"
+    device_id: Optional[str] = Field(None, max_length=150)
+
+    @field_validator("desired_role")
+    @classmethod
+    def validate_desired_role(cls, value: str) -> str:
+        if value != "free":
+            raise ValueError("Le role demande doit etre free.")
+        return value
+
+class RefreshTokenInput(BaseModel):
+    refresh_token: str = Field(..., min_length=20)
+
+class LogoutInput(BaseModel):
+    refresh_token: Optional[str] = None
+
+class AuthUserResponse(BaseModel):
+    id: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    role: str
+    premium_expires_at: Optional[str] = None
+
+class AuthResponse(BaseModel):
+    access_token: str
+    refresh_token: str = ""
+    expires_at: str
+    user: AuthUserResponse
+    quota: QuotaResponse
+
 class ScanActions(BaseModel):
     add_to_collection: bool
     enable_marketplace_button: bool

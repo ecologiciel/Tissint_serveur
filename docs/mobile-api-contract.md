@@ -17,6 +17,14 @@ All `/api/v1/*` endpoints require:
 X-API-Key: <api key>
 ```
 
+Authenticated user endpoints also use:
+
+```http
+Authorization: Bearer <access_token>
+```
+
+Access and refresh tokens are opaque server-side session tokens; only their hashes are persisted.
+
 `GET /health` is public and can be used before login or sync.
 
 ## Error Shape
@@ -41,6 +49,11 @@ The mobile app should branch on `error.code`, not on translated `message`.
 | Mobile flow | Method | Path | Response type |
 | --- | --- | --- | --- |
 | Connectivity check | `GET` | `/health` | `HealthResponse` |
+| Register | `POST` JSON | `/api/v1/auth/register` | `AuthResponse` |
+| Login | `POST` JSON | `/api/v1/auth/login` | `AuthResponse` |
+| Current user | `GET` | `/api/v1/auth/me` | `AuthResponse` |
+| Refresh token | `POST` JSON | `/api/v1/auth/refresh` | `AuthResponse` |
+| Logout | `POST` JSON | `/api/v1/auth/logout` | `{ status: "ok" }` |
 | Quota snapshot | `GET` | `/api/v1/quota/me` | `QuotaResponse` |
 | Exterior scan | `POST` multipart | `/api/v1/scan/exterior` | `ScanDecisionResponse` |
 | Add interior cut | `PATCH` multipart | `/api/v1/scan/{scan_id}/interior` | `ScanDecisionResponse` |

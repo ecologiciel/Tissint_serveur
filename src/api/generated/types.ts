@@ -12,6 +12,24 @@ export type ApiErrorResponse = {
   "error": ApiError;
 };
 
+export type AuthResponse = {
+  "access_token": string;
+  "refresh_token"?: string;
+  "expires_at": string;
+  "user": AuthUserResponse;
+  "quota": QuotaResponse;
+};
+
+export type AuthUserResponse = {
+  "id": string;
+  "first_name"?: string | null;
+  "last_name"?: string | null;
+  "phone"?: string | null;
+  "email"?: string | null;
+  "role": string;
+  "premium_expires_at"?: string | null;
+};
+
 export type Body_scan_exterior_api_v1_scan_exterior_post = {
   "client_uuid": string;
   "files_exterior": string[];
@@ -49,6 +67,16 @@ export type HealthResponse = {
   "status": string;
   "service": string;
   "database": string;
+};
+
+export type LoginInput = {
+  "phone_or_email": string;
+  "password": string;
+  "device_id"?: string | null;
+};
+
+export type LogoutInput = {
+  "refresh_token"?: string | null;
 };
 
 export type MarketplaceListingResponse = {
@@ -103,6 +131,20 @@ export type QuotaResponse = {
   "resets_at"?: string | null;
 };
 
+export type RefreshTokenInput = {
+  "refresh_token": string;
+};
+
+export type RegisterInput = {
+  "first_name": string;
+  "last_name": string;
+  "phone": string;
+  "email"?: string | null;
+  "password": string;
+  "desired_role"?: string;
+  "device_id"?: string | null;
+};
+
 export type ScanActions = {
   "add_to_collection": boolean;
   "enable_marketplace_button": boolean;
@@ -131,16 +173,22 @@ export type ScanMetadataApplied = {
 export type ApiSchemas = {
   "ApiError": ApiError;
   "ApiErrorResponse": ApiErrorResponse;
+  "AuthResponse": AuthResponse;
+  "AuthUserResponse": AuthUserResponse;
   "Body_scan_exterior_api_v1_scan_exterior_post": Body_scan_exterior_api_v1_scan_exterior_post;
   "Body_scan_interior_update_api_v1_scan__scan_id__interior_patch": Body_scan_interior_update_api_v1_scan__scan_id__interior_patch;
   "CollectionItemResponse": CollectionItemResponse;
   "CreateMessageInput": CreateMessageInput;
   "HealthResponse": HealthResponse;
+  "LoginInput": LoginInput;
+  "LogoutInput": LogoutInput;
   "MarketplaceListingResponse": MarketplaceListingResponse;
   "MessageResponse": MessageResponse;
   "PublicListingItem": PublicListingItem;
   "PublishListingInput": PublishListingInput;
   "QuotaResponse": QuotaResponse;
+  "RefreshTokenInput": RefreshTokenInput;
+  "RegisterInput": RegisterInput;
   "ScanActions": ScanActions;
   "ScanDecisionResponse": ScanDecisionResponse;
   "ScanMetadataApplied": ScanMetadataApplied;

@@ -4,11 +4,12 @@ from typing import List, Optional
 import uuid
 import anyio
 import os
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -21,9 +22,15 @@ from exceptions import (
 )
 from schemas import (
     ApiErrorResponse,
+    AuthResponse,
+    AuthUserResponse,
     CollectionItemResponse,
     HealthResponse,
+    LoginInput,
+    LogoutInput,
     QuotaResponse,
+    RefreshTokenInput,
+    RegisterInput,
     ScanDecisionResponse,
     ScanMetadataInput,
     PublishListingInput,
@@ -32,7 +39,7 @@ from schemas import (
     CreateMessageInput,
     MessageResponse,
 )
-from security import verify_api_key, validate_upload_file
+from security import create_token, hash_password, hash_token, verify_api_key, verify_password, validate_upload_file
 from app.services.notifier import send_telegram_radar_alert
 from billing import check_scan_quota, decrement_quota, get_or_create_subscription, quota_limit_for_tier
 
@@ -42,7 +49,7 @@ from fusion_engine import MeteoriteFusionEngine
 from business_logic import BusinessOrchestrator
 
 # Import database and storage components
-from database import engine, Base, get_db, ScanModel, ListingModel, CollectionItemModel, MessageModel
+from database import engine, Base, get_db, UserModel, AuthSessionModel, ScanModel, ListingModel, CollectionItemModel, MessageModel
 from storage import storage_provider
 
 @asynccontextmanager
@@ -111,6 +118,110 @@ async def healthcheck():
         "database": "ok"
     }
 
+ACCESS_TOKEN_TTL_MINUTES = int(os.getenv("ACCESS_TOKEN_TTL_MINUTES", "30"))
+REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
+
+def _utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def _normalize_email(email: Optional[str]) -> Optional[str]:
+    return email.strip().lower() if email and email.strip() else None
+
+def _normalize_phone(phone: str) -> str:
+    return phone.strip()
+
+def _quota_response(subscription) -> QuotaResponse:
+    daily_limit = quota_limit_for_tier(subscription.tier)
+    remaining_today = daily_limit if subscription.tier in {"premium", "admin"} else max(subscription.remaining_tokens, 0)
+    return QuotaResponse(
+        role=subscription.tier,
+        daily_limit=daily_limit,
+        remaining_today=remaining_today,
+        resets_at=None,
+    )
+
+def _auth_user_response(user: UserModel, subscription) -> AuthUserResponse:
+    return AuthUserResponse(
+        id=user.id,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        phone=user.phone,
+        email=user.email,
+        role=subscription.tier,
+        premium_expires_at=(
+            subscription.subscription_expires_at.isoformat()
+            if subscription.subscription_expires_at
+            else None
+        ),
+    )
+
+def _bearer_token(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise AppProductionException("UNAUTHORIZED", "Session invalide ou expiree.", 401)
+    token = authorization[7:].strip()
+    if not token:
+        raise AppProductionException("UNAUTHORIZED", "Session invalide ou expiree.", 401)
+    return token
+
+async def _create_auth_session(user_id: str, device_id: Optional[str], db: AsyncSession):
+    access_token = create_token()
+    refresh_token = create_token()
+    now = _utc_now()
+    session = AuthSessionModel(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        device_id=device_id,
+        access_token_hash=hash_token(access_token),
+        refresh_token_hash=hash_token(refresh_token),
+        access_expires_at=now + timedelta(minutes=ACCESS_TOKEN_TTL_MINUTES),
+        refresh_expires_at=now + timedelta(days=REFRESH_TOKEN_TTL_DAYS),
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+    return session, access_token, refresh_token
+
+async def _auth_response(
+    user: UserModel,
+    session: AuthSessionModel,
+    subscription,
+    access_token: str,
+    refresh_token: str = "",
+) -> AuthResponse:
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=session.access_expires_at.isoformat(),
+        user=_auth_user_response(user, subscription),
+        quota=_quota_response(subscription),
+    )
+
+async def _current_auth_context(
+    authorization: Optional[str],
+    db: AsyncSession,
+):
+    token = _bearer_token(authorization)
+    token_hash = hash_token(token)
+    now = _utc_now()
+    result = await db.execute(
+        select(AuthSessionModel).where(
+            AuthSessionModel.access_token_hash == token_hash,
+            AuthSessionModel.revoked_at.is_(None),
+            AuthSessionModel.access_expires_at > now,
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise AppProductionException("UNAUTHORIZED", "Session invalide ou expiree.", 401)
+
+    user_result = await db.execute(select(UserModel).where(UserModel.id == session.user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise AppProductionException("UNAUTHORIZED", "Session invalide ou expiree.", 401)
+
+    subscription = await get_or_create_subscription(user.id, db)
+    return user, session, subscription, token
+
 def resolve_user_id(x_user_id: Optional[str] = Header(None)) -> str:
     user_id = (x_user_id or "anonymous").strip()
     if len(user_id) < 3 or len(user_id) > 100:
@@ -118,6 +229,165 @@ def resolve_user_id(x_user_id: Optional[str] = Header(None)) -> str:
     if not all(char.isalnum() or char in {"_", "-"} for char in user_id):
         raise AppProductionException("VALIDATION_ERROR", "Identifiant utilisateur invalide.", 400)
     return user_id
+
+@app.post(
+    "/api/v1/auth/register",
+    response_model=AuthResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def register(
+    payload: RegisterInput,
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    phone = _normalize_phone(payload.phone)
+    email = _normalize_email(payload.email)
+    existing_query = select(UserModel).where(UserModel.phone == phone)
+    if email:
+        existing_query = select(UserModel).where(or_(UserModel.phone == phone, UserModel.email == email))
+    existing_result = await db.execute(existing_query)
+    if existing_result.scalar_one_or_none():
+        raise AppProductionException("CONFLICT", "Un compte existe deja avec ces identifiants.", 409)
+
+    user = UserModel(
+        id=str(uuid.uuid4()),
+        first_name=payload.first_name.strip(),
+        last_name=payload.last_name.strip(),
+        phone=phone,
+        email=email,
+        password_hash=hash_password(payload.password),
+        role=payload.desired_role,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    subscription = await get_or_create_subscription(user.id, db)
+    subscription.tier = payload.desired_role
+    subscription.remaining_tokens = quota_limit_for_tier(payload.desired_role)
+    await db.commit()
+    await db.refresh(subscription)
+
+    session, access_token, refresh_token = await _create_auth_session(user.id, payload.device_id, db)
+    return await _auth_response(user, session, subscription, access_token, refresh_token)
+
+
+@app.post(
+    "/api/v1/auth/login",
+    response_model=AuthResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def login(
+    payload: LoginInput,
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    identifier = payload.phone_or_email.strip()
+    email = _normalize_email(identifier)
+    result = await db.execute(
+        select(UserModel).where(or_(UserModel.phone == identifier, UserModel.email == email))
+    )
+    user = result.scalar_one_or_none()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise AppProductionException("UNAUTHORIZED", "Identifiants invalides.", 401)
+
+    subscription = await get_or_create_subscription(user.id, db)
+    user.role = subscription.tier
+    await db.commit()
+    await db.refresh(user)
+
+    session, access_token, refresh_token = await _create_auth_session(user.id, payload.device_id, db)
+    return await _auth_response(user, session, subscription, access_token, refresh_token)
+
+
+@app.get(
+    "/api/v1/auth/me",
+    response_model=AuthResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def auth_me(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, session, subscription, access_token = await _current_auth_context(authorization, db)
+    return await _auth_response(user, session, subscription, access_token)
+
+
+@app.post(
+    "/api/v1/auth/refresh",
+    response_model=AuthResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def refresh_auth(
+    payload: RefreshTokenInput,
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    now = _utc_now()
+    result = await db.execute(
+        select(AuthSessionModel).where(
+            AuthSessionModel.refresh_token_hash == hash_token(payload.refresh_token),
+            AuthSessionModel.revoked_at.is_(None),
+            AuthSessionModel.refresh_expires_at > now,
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise AppProductionException("UNAUTHORIZED", "Session invalide ou expiree.", 401)
+
+    user_result = await db.execute(select(UserModel).where(UserModel.id == session.user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise AppProductionException("UNAUTHORIZED", "Session invalide ou expiree.", 401)
+
+    access_token = create_token()
+    refresh_token = create_token()
+    session.access_token_hash = hash_token(access_token)
+    session.refresh_token_hash = hash_token(refresh_token)
+    session.access_expires_at = now + timedelta(minutes=ACCESS_TOKEN_TTL_MINUTES)
+    session.refresh_expires_at = now + timedelta(days=REFRESH_TOKEN_TTL_DAYS)
+    await db.commit()
+    await db.refresh(session)
+
+    subscription = await get_or_create_subscription(user.id, db)
+    return await _auth_response(user, session, subscription, access_token, refresh_token)
+
+
+@app.post(
+    "/api/v1/auth/logout",
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def logout(
+    payload: LogoutInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    token_hash = hash_token(payload.refresh_token) if payload.refresh_token else None
+    if not token_hash and authorization:
+        token_hash = hash_token(_bearer_token(authorization))
+
+    if token_hash:
+        result = await db.execute(
+            select(AuthSessionModel).where(
+                or_(
+                    AuthSessionModel.refresh_token_hash == token_hash,
+                    AuthSessionModel.access_token_hash == token_hash,
+                )
+            )
+        )
+        session = result.scalar_one_or_none()
+        if session and session.revoked_at is None:
+            session.revoked_at = _utc_now()
+            await db.commit()
+
+    return {"status": "ok"}
 
 @app.get(
     "/api/v1/quota/me",
@@ -131,15 +401,7 @@ async def get_quota_me(
     api_key: str = Depends(verify_api_key),
 ):
     subscription = await get_or_create_subscription(user_id, db)
-    daily_limit = quota_limit_for_tier(subscription.tier)
-    remaining_today = daily_limit if subscription.tier in {"premium", "admin"} else max(subscription.remaining_tokens, 0)
-
-    return QuotaResponse(
-        role=subscription.tier,
-        daily_limit=daily_limit,
-        remaining_today=remaining_today,
-        resets_at=None,
-    )
+    return _quota_response(subscription)
 
 def _blur_coordinates(scan: ScanModel):
     safe_lat = round(scan.latitude, 1) if scan.latitude is not None else None
