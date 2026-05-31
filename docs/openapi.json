@@ -346,6 +346,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/PublishListingInput"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -487,6 +504,144 @@
                     "$ref": "#/components/schemas/PublicListingItem"
                   },
                   "title": "Response Get Marketplace Listings Api V1 Marketplace Listings Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Requete invalide",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Cle API invalide ou manquante",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Quota epuise",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Ressource introuvable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflit metier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Fichier trop volumineux",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Format de fichier non supporte",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Erreur de validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service indisponible",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Erreur interne",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/marketplace/listings/{listing_id}": {
+      "get": {
+        "summary": "Get Marketplace Listing Detail",
+        "operationId": "get_marketplace_listing_detail_api_v1_marketplace_listings__listing_id__get",
+        "parameters": [
+          {
+            "name": "listing_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Listing Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicListingItem"
                 }
               }
             }
@@ -1086,6 +1241,10 @@
             "type": "string",
             "title": "Message"
           },
+          "listing_id": {
+            "type": "string",
+            "title": "Listing Id"
+          },
           "scan_id": {
             "type": "string",
             "title": "Scan Id"
@@ -1101,6 +1260,10 @@
           "confidence": {
             "type": "number",
             "title": "Confidence"
+          },
+          "price": {
+            "type": "number",
+            "title": "Price"
           },
           "weight": {
             "anyOf": [
@@ -1153,10 +1316,12 @@
         "required": [
           "status",
           "message",
+          "listing_id",
           "scan_id",
           "is_rare_candidate",
           "dominant_class",
-          "confidence"
+          "confidence",
+          "price"
         ],
         "title": "MarketplaceListingResponse"
       },
@@ -1256,6 +1421,44 @@
               }
             ],
             "title": "Blurred Longitude"
+          },
+          "is_rare": {
+            "type": "boolean",
+            "title": "Is Rare",
+            "default": false
+          },
+          "price_mode": {
+            "type": "string",
+            "title": "Price Mode",
+            "default": "on_request"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "can_contact": {
+            "type": "boolean",
+            "title": "Can Contact",
+            "default": false
+          },
+          "contact_lock_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contact Lock Reason",
+            "default": "premium_required"
           }
         },
         "type": "object",
@@ -1271,6 +1474,24 @@
           "blurred_longitude"
         ],
         "title": "PublicListingItem"
+      },
+      "PublishListingInput": {
+        "properties": {
+          "price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          }
+        },
+        "type": "object",
+        "title": "PublishListingInput"
       },
       "ScanActions": {
         "properties": {

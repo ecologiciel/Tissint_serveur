@@ -43,10 +43,12 @@ export type HealthResponse = {
 export type MarketplaceListingResponse = {
   "status": string;
   "message": string;
+  "listing_id": string;
   "scan_id": string;
   "is_rare_candidate": boolean;
   "dominant_class": string;
   "confidence": number;
+  "price": number;
   "weight"?: number | null;
   "magnetic"?: boolean | null;
   "blurred_latitude"?: number | null;
@@ -72,6 +74,15 @@ export type PublicListingItem = {
   "weight": number | null;
   "blurred_latitude": number | null;
   "blurred_longitude": number | null;
+  "is_rare"?: boolean;
+  "price_mode"?: string;
+  "created_at"?: string | null;
+  "can_contact"?: boolean;
+  "contact_lock_reason"?: string | null;
+};
+
+export type PublishListingInput = {
+  "price"?: number | null;
 };
 
 export type ScanActions = {
@@ -109,6 +120,7 @@ export type ApiSchemas = {
   "MarketplaceListingResponse": MarketplaceListingResponse;
   "MessageResponse": MessageResponse;
   "PublicListingItem": PublicListingItem;
+  "PublishListingInput": PublishListingInput;
   "ScanActions": ScanActions;
   "ScanDecisionResponse": ScanDecisionResponse;
   "ScanMetadataApplied": ScanMetadataApplied;

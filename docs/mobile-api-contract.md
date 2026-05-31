@@ -43,8 +43,9 @@ The mobile app should branch on `error.code`, not on translated `message`.
 | Connectivity check | `GET` | `/health` | `HealthResponse` |
 | Exterior scan | `POST` multipart | `/api/v1/scan/exterior` | `ScanDecisionResponse` |
 | Add interior cut | `PATCH` multipart | `/api/v1/scan/{scan_id}/interior` | `ScanDecisionResponse` |
-| Publish scan | `POST` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
+| Publish scan | `POST` JSON `{ price? }` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
 | Marketplace list | `GET` | `/api/v1/marketplace/listings` | `PublicListingItem[]` |
+| Marketplace detail | `GET` | `/api/v1/marketplace/listings/{listing_id}` | `PublicListingItem` |
 | Send chat message | `POST` JSON | `/api/v1/marketplace/chat/send` | `MessageResponse` |
 | Chat history | `GET` | `/api/v1/marketplace/chat/history/{conversation_id}` | `MessageResponse[]` |
 

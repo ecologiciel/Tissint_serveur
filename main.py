@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks, Body
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
@@ -24,6 +24,7 @@ from schemas import (
     HealthResponse,
     ScanDecisionResponse,
     ScanMetadataInput,
+    PublishListingInput,
     MarketplaceListingResponse,
     PublicListingItem,
     CreateMessageInput,
@@ -107,6 +108,34 @@ async def healthcheck():
         "service": "tinssit-backend",
         "database": "ok"
     }
+
+def _blur_coordinates(scan: ScanModel):
+    safe_lat = round(scan.latitude, 1) if scan.latitude is not None else None
+    safe_lon = round(scan.longitude, 1) if scan.longitude is not None else None
+    return safe_lat, safe_lon
+
+def _is_rare_candidate(dominant_class: str, confidence: float) -> bool:
+    rare_classes = ["Achondrite", "Carbonee", "Martian", "Lunar", "Pallasite", "Iron", "Metallique"]
+    return dominant_class in rare_classes and confidence >= 0.85
+
+def _public_listing_item(listing: ListingModel, scan: ScanModel) -> PublicListingItem:
+    safe_lat, safe_lon = _blur_coordinates(scan)
+    return PublicListingItem(
+        listing_id=listing.id,
+        scan_id=scan.id,
+        price=listing.price,
+        status=listing.status,
+        dominant_class=scan.dominant_class,
+        confidence=scan.class_confidence,
+        weight=scan.weight,
+        blurred_latitude=safe_lat,
+        blurred_longitude=safe_lon,
+        is_rare=_is_rare_candidate(scan.dominant_class, scan.class_confidence),
+        price_mode="on_request" if listing.price <= 0 else "fixed_total",
+        created_at=listing.created_at.isoformat() if listing.created_at else None,
+        can_contact=False,
+        contact_lock_reason="premium_required",
+    )
 
 @app.post(
     "/api/v1/scan/exterior",
@@ -330,6 +359,7 @@ async def scan_interior_update(
 async def publish_to_marketplace(
     scan_id: str,
     background_tasks: BackgroundTasks,
+    payload: Optional[PublishListingInput] = Body(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key)
 ):
@@ -348,11 +378,8 @@ async def publish_to_marketplace(
     confidence = scan.class_confidence
     user_id = scan.user_id
 
-    rare_classes = ["Achondrite", "Carbonee", "Martian", "Lunar", "Pallasite", "Iron", "Metallique"]
-    strict_threshold = 0.85
-
     # Le Déclencheur Strict pour le bot Telegram
-    is_rare = dominant_class in rare_classes and confidence >= strict_threshold
+    is_rare = _is_rare_candidate(dominant_class, confidence)
     if is_rare:
         background_tasks.add_task(
             send_telegram_radar_alert,
@@ -362,17 +389,37 @@ async def publish_to_marketplace(
             user_id=user_id
         )
 
+    listing_price = payload.price if payload and payload.price is not None else 0.0
+    listing_result = await db.execute(select(ListingModel).where(ListingModel.scan_id == scan_id))
+    listing = listing_result.scalar_one_or_none()
+    if listing:
+        listing.status = "available"
+        if payload and payload.price is not None:
+            listing.price = listing_price
+    else:
+        listing = ListingModel(
+            id=str(uuid.uuid4()),
+            scan_id=scan_id,
+            price=listing_price,
+            status="available"
+        )
+        db.add(listing)
+
+    await db.commit()
+    await db.refresh(listing)
+
     # Security: Anonymisation & Floutage (Arrondi d'une décimale pour une précision régionale protectrice d'environ ~11km)
-    safe_lat = round(scan.latitude, 1) if scan.latitude is not None else None
-    safe_lon = round(scan.longitude, 1) if scan.longitude is not None else None
+    safe_lat, safe_lon = _blur_coordinates(scan)
 
     return MarketplaceListingResponse(
-        status="success",
+        status=listing.status,
         message="Requête de mise en vente traitée. Données géospatiales anonymisées.",
+        listing_id=listing.id,
         scan_id=scan_id,
         is_rare_candidate=is_rare,
         dominant_class=dominant_class,
         confidence=confidence,
+        price=listing.price,
         weight=scan.weight,
         magnetic=scan.magnetic,
         blurred_latitude=safe_lat,
@@ -399,24 +446,31 @@ async def get_marketplace_listings(
     result = await db.execute(query)
     rows = result.all()
 
-    listings = []
-    for listing, scan in rows:
-        safe_lat = round(scan.latitude, 1) if scan.latitude is not None else None
-        safe_lon = round(scan.longitude, 1) if scan.longitude is not None else None
-        
-        listings.append(PublicListingItem(
-            listing_id=listing.id,
-            scan_id=scan.id,
-            price=listing.price,
-            status=listing.status,
-            dominant_class=scan.dominant_class,
-            confidence=scan.class_confidence,
-            weight=scan.weight,
-            blurred_latitude=safe_lat,
-            blurred_longitude=safe_lon
-        ))
+    listings = [_public_listing_item(listing, scan) for listing, scan in rows]
         
     return listings
+
+
+@app.get(
+    "/api/v1/marketplace/listings/{listing_id}",
+    response_model=PublicListingItem,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_marketplace_listing_detail(
+    listing_id: str,
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key)
+):
+    query = select(ListingModel, ScanModel).join(ScanModel, ListingModel.scan_id == ScanModel.id).where(ListingModel.id == listing_id)
+    result = await db.execute(query)
+    row = result.first()
+
+    if not row:
+        raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+
+    listing, scan = row
+    return _public_listing_item(listing, scan)
 
 
 @app.post(

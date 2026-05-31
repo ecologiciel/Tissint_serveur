@@ -37,13 +37,18 @@ class ScanDecisionResponse(BaseModel):
     scan_id: str
     is_sync_retry: bool = False
 
+class PublishListingInput(BaseModel):
+    price: Optional[float] = Field(None, ge=0.0)
+
 class MarketplaceListingResponse(BaseModel):
     status: str
     message: str
+    listing_id: str
     scan_id: str
     is_rare_candidate: bool
     dominant_class: str
     confidence: float
+    price: float
     weight: Optional[float] = None
     magnetic: Optional[bool] = None
     blurred_latitude: Optional[float] = Field(None, description="Latitude floutée pour anonymisation (précision ~11km)")
@@ -59,6 +64,11 @@ class PublicListingItem(BaseModel):
     weight: Optional[float]
     blurred_latitude: Optional[float]
     blurred_longitude: Optional[float]
+    is_rare: bool = False
+    price_mode: str = "on_request"
+    created_at: Optional[str] = None
+    can_contact: bool = False
+    contact_lock_reason: Optional[str] = "premium_required"
 
 class CreateMessageInput(BaseModel):
     conversation_id: str = Field(..., description="ID unique de la conversation")
