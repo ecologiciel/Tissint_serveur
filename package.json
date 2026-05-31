@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
+    "test:api": "python -m pytest",
     "api:openapi": "python scripts/export_openapi.py",
     "api:types": "python scripts/export_ts_types.py",
     "api:contract": "npm run api:openapi && npm run api:types"

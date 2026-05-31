@@ -1,20 +1,44 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# Tissint Backend
 
-# Run and deploy your AI Studio app
+FastAPI backend for the Tissint mobile app: auth, quota, scan intake, collection, marketplace, admin radar, audit, and billing contracts.
 
-This contains everything you need to run your app locally.
+## Local Production-Like Run
 
-View your app in AI Studio: https://ai.studio/apps/158f02d7-92b5-471d-bc28-d00792de5ed1
+1. Copy `.env.example` to `.env` and set real secrets.
+2. Start Postgres and the API:
 
-## Run Locally
+```bash
+docker compose up -d --build
+```
 
-**Prerequisites:**  Node.js
+3. Verify the service:
 
+```bash
+curl http://127.0.0.1:8000/health
+```
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Contract Workflow
+
+The mobile app consumes the OpenAPI-derived TypeScript types from:
+
+- `docs/openapi.json`
+- `src/api/generated/types.ts`
+
+Regenerate them after API schema changes:
+
+```bash
+npm run api:contract
+```
+
+## Tests
+
+The API test suite needs Postgres. For local Codex runs, set `DATABASE_URL` to a running test database and skip AI model loading:
+
+```bash
+set TINSSIT_SKIP_MODEL_LOAD=1
+set API_KEY=tissint_ci_key
+set DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:55432/meteorite_db
+pytest
+```
+
+CI uses `requirements-ci.txt`, which intentionally excludes the Torch inference stack. The production Docker image still installs `requirements.txt`.

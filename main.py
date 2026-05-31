@@ -70,7 +70,11 @@ from billing import (
 )
 
 # Import of our processing modules
-from pipeline_vision import VisionPipeline
+SKIP_MODEL_LOAD = os.getenv("TINSSIT_SKIP_MODEL_LOAD") == "1"
+if SKIP_MODEL_LOAD:
+    VisionPipeline = None
+else:
+    from pipeline_vision import VisionPipeline
 from fusion_engine import MeteoriteFusionEngine
 from business_logic import BusinessOrchestrator
 
@@ -152,7 +156,6 @@ ERROR_RESPONSES = {
 }
 
 # Global initialization of our orchestration blocks
-SKIP_MODEL_LOAD = os.getenv("TINSSIT_SKIP_MODEL_LOAD") == "1"
 vision_pipeline = None if SKIP_MODEL_LOAD else VisionPipeline()
 fusion_engine = MeteoriteFusionEngine()
 business_orchestrator = BusinessOrchestrator()
