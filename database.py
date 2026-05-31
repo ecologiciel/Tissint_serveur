@@ -52,6 +52,15 @@ class ListingModel(Base):
     status = Column(String, nullable=False, default="available") # available, reserved, sold
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
+class CollectionItemModel(Base):
+    __tablename__ = "collection_items"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
+    scan_id = Column(String, ForeignKey("scans.id"), index=True, nullable=False)
+    status = Column(String, nullable=False, default="eligible")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
 class MessageModel(Base):
     __tablename__ = "messages"
     

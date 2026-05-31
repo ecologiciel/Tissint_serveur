@@ -27,6 +27,17 @@ export type Body_scan_interior_update_api_v1_scan__scan_id__interior_patch = {
   "file_interior": string;
 };
 
+export type CollectionItemResponse = {
+  "id": string;
+  "scan_id": string;
+  "class_name": string;
+  "fusion_score": number;
+  "status": string;
+  "created_at": string;
+  "main_image_uri"?: string | null;
+  "meteorite_probability"?: number | null;
+};
+
 export type CreateMessageInput = {
   "conversation_id": string;
   "sender_id": string;
@@ -85,6 +96,13 @@ export type PublishListingInput = {
   "price"?: number | null;
 };
 
+export type QuotaResponse = {
+  "role": string;
+  "daily_limit": number;
+  "remaining_today": number;
+  "resets_at"?: string | null;
+};
+
 export type ScanActions = {
   "add_to_collection": boolean;
   "enable_marketplace_button": boolean;
@@ -115,12 +133,14 @@ export type ApiSchemas = {
   "ApiErrorResponse": ApiErrorResponse;
   "Body_scan_exterior_api_v1_scan_exterior_post": Body_scan_exterior_api_v1_scan_exterior_post;
   "Body_scan_interior_update_api_v1_scan__scan_id__interior_patch": Body_scan_interior_update_api_v1_scan__scan_id__interior_patch;
+  "CollectionItemResponse": CollectionItemResponse;
   "CreateMessageInput": CreateMessageInput;
   "HealthResponse": HealthResponse;
   "MarketplaceListingResponse": MarketplaceListingResponse;
   "MessageResponse": MessageResponse;
   "PublicListingItem": PublicListingItem;
   "PublishListingInput": PublishListingInput;
+  "QuotaResponse": QuotaResponse;
   "ScanActions": ScanActions;
   "ScanDecisionResponse": ScanDecisionResponse;
   "ScanMetadataApplied": ScanMetadataApplied;

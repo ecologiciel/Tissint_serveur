@@ -15,6 +15,12 @@ class HealthResponse(BaseModel):
     service: str
     database: str
 
+class QuotaResponse(BaseModel):
+    role: str
+    daily_limit: int
+    remaining_today: int
+    resets_at: Optional[str] = None
+
 class ScanActions(BaseModel):
     add_to_collection: bool
     enable_marketplace_button: bool
@@ -69,6 +75,16 @@ class PublicListingItem(BaseModel):
     created_at: Optional[str] = None
     can_contact: bool = False
     contact_lock_reason: Optional[str] = "premium_required"
+
+class CollectionItemResponse(BaseModel):
+    id: str
+    scan_id: str
+    class_name: str
+    fusion_score: float
+    status: str
+    created_at: str
+    main_image_uri: Optional[str] = None
+    meteorite_probability: Optional[float] = None
 
 class CreateMessageInput(BaseModel):
     conversation_id: str = Field(..., description="ID unique de la conversation")

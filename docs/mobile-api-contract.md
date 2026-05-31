@@ -41,8 +41,12 @@ The mobile app should branch on `error.code`, not on translated `message`.
 | Mobile flow | Method | Path | Response type |
 | --- | --- | --- | --- |
 | Connectivity check | `GET` | `/health` | `HealthResponse` |
+| Quota snapshot | `GET` | `/api/v1/quota/me` | `QuotaResponse` |
 | Exterior scan | `POST` multipart | `/api/v1/scan/exterior` | `ScanDecisionResponse` |
 | Add interior cut | `PATCH` multipart | `/api/v1/scan/{scan_id}/interior` | `ScanDecisionResponse` |
+| Collection list | `GET` | `/api/v1/collection` | `CollectionItemResponse[]` |
+| Add scan to collection | `POST` | `/api/v1/collection/{scan_id}` | `CollectionItemResponse` |
+| Collection detail | `GET` | `/api/v1/collection/{scan_id}` | `CollectionItemResponse` |
 | Publish scan | `POST` JSON `{ price? }` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
 | Marketplace list | `GET` | `/api/v1/marketplace/listings` | `PublicListingItem[]` |
 | Marketplace detail | `GET` | `/api/v1/marketplace/listings/{listing_id}` | `PublicListingItem` |

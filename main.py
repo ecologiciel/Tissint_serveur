@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks, Body
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks, Body, Header
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
@@ -21,7 +21,9 @@ from exceptions import (
 )
 from schemas import (
     ApiErrorResponse,
+    CollectionItemResponse,
     HealthResponse,
+    QuotaResponse,
     ScanDecisionResponse,
     ScanMetadataInput,
     PublishListingInput,
@@ -32,7 +34,7 @@ from schemas import (
 )
 from security import verify_api_key, validate_upload_file
 from app.services.notifier import send_telegram_radar_alert
-from billing import check_scan_quota, decrement_quota
+from billing import check_scan_quota, decrement_quota, get_or_create_subscription, quota_limit_for_tier
 
 # Import of our processing modules
 from pipeline_vision import VisionPipeline
@@ -40,7 +42,7 @@ from fusion_engine import MeteoriteFusionEngine
 from business_logic import BusinessOrchestrator
 
 # Import database and storage components
-from database import engine, Base, get_db, ScanModel, ListingModel, MessageModel
+from database import engine, Base, get_db, ScanModel, ListingModel, CollectionItemModel, MessageModel
 from storage import storage_provider
 
 @asynccontextmanager
@@ -109,6 +111,36 @@ async def healthcheck():
         "database": "ok"
     }
 
+def resolve_user_id(x_user_id: Optional[str] = Header(None)) -> str:
+    user_id = (x_user_id or "anonymous").strip()
+    if len(user_id) < 3 or len(user_id) > 100:
+        raise AppProductionException("VALIDATION_ERROR", "Identifiant utilisateur invalide.", 400)
+    if not all(char.isalnum() or char in {"_", "-"} for char in user_id):
+        raise AppProductionException("VALIDATION_ERROR", "Identifiant utilisateur invalide.", 400)
+    return user_id
+
+@app.get(
+    "/api/v1/quota/me",
+    response_model=QuotaResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_quota_me(
+    user_id: str = Depends(resolve_user_id),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    subscription = await get_or_create_subscription(user_id, db)
+    daily_limit = quota_limit_for_tier(subscription.tier)
+    remaining_today = daily_limit if subscription.tier in {"premium", "admin"} else max(subscription.remaining_tokens, 0)
+
+    return QuotaResponse(
+        role=subscription.tier,
+        daily_limit=daily_limit,
+        remaining_today=remaining_today,
+        resets_at=None,
+    )
+
 def _blur_coordinates(scan: ScanModel):
     safe_lat = round(scan.latitude, 1) if scan.latitude is not None else None
     safe_lon = round(scan.longitude, 1) if scan.longitude is not None else None
@@ -135,6 +167,41 @@ def _public_listing_item(listing: ListingModel, scan: ScanModel) -> PublicListin
         created_at=listing.created_at.isoformat() if listing.created_at else None,
         can_contact=False,
         contact_lock_reason="premium_required",
+    )
+
+def _collection_status_for_scan(scan: ScanModel, listing: Optional[ListingModel] = None) -> str:
+    if listing:
+        if listing.status == "sold":
+            return "sold"
+        if listing.status in {"available", "reserved"}:
+            return "listed"
+    if scan.status_code == "DIAGNOSTIC_SUCCESS_HIGH":
+        return "eligible"
+    if scan.status_code == "DIAGNOSTIC_HESITANT":
+        return "needs_cut"
+    return "pending_validation"
+
+def _collection_item_response(
+    collection: CollectionItemModel,
+    scan: ScanModel,
+    listing: Optional[ListingModel] = None,
+) -> CollectionItemResponse:
+    status_value = _collection_status_for_scan(scan, listing)
+    if collection.status != status_value:
+        collection.status = status_value
+    main_image_uri = None
+    if scan.exterior_images_paths:
+        main_image_uri = scan.exterior_images_paths[0]
+
+    return CollectionItemResponse(
+        id=collection.id,
+        scan_id=scan.id,
+        class_name=scan.dominant_class,
+        fusion_score=scan.meteorite_probability,
+        status=status_value,
+        created_at=collection.created_at.isoformat() if collection.created_at else "",
+        main_image_uri=main_image_uri,
+        meteorite_probability=scan.meteorite_probability,
     )
 
 @app.post(
@@ -349,6 +416,112 @@ async def scan_interior_update(
     final_decision["scan_id"] = scan_id
     
     return final_decision
+
+@app.get(
+    "/api/v1/collection",
+    response_model=List[CollectionItemResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def list_collection(
+    user_id: str = Depends(resolve_user_id),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    query = (
+        select(CollectionItemModel, ScanModel, ListingModel)
+        .join(ScanModel, CollectionItemModel.scan_id == ScanModel.id)
+        .outerjoin(ListingModel, ListingModel.scan_id == ScanModel.id)
+        .where(CollectionItemModel.user_id == user_id)
+        .order_by(CollectionItemModel.created_at.desc())
+    )
+    result = await db.execute(query)
+    rows = result.all()
+
+    items = [_collection_item_response(collection, scan, listing) for collection, scan, listing in rows]
+    await db.commit()
+    return items
+
+
+@app.post(
+    "/api/v1/collection/{scan_id}",
+    response_model=CollectionItemResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def add_scan_to_collection(
+    scan_id: str,
+    user_id: str = Depends(resolve_user_id),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    result = await db.execute(select(ScanModel).where(ScanModel.id == scan_id))
+    scan = result.scalar_one_or_none()
+
+    if not scan:
+        raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
+
+    owner_id = scan.user_id if user_id == "anonymous" else user_id
+    if scan.user_id != owner_id:
+        raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
+
+    if scan.status_code not in {"DIAGNOSTIC_SUCCESS_HIGH", "DIAGNOSTIC_HESITANT"}:
+        raise AppProductionException("CONFLICT", "Ce scan n'est pas eligible a la collection.", 409)
+
+    existing_result = await db.execute(
+        select(CollectionItemModel).where(
+            CollectionItemModel.user_id == owner_id,
+            CollectionItemModel.scan_id == scan_id,
+        )
+    )
+    collection = existing_result.scalar_one_or_none()
+
+    if not collection:
+        collection = CollectionItemModel(
+            id=str(uuid.uuid4()),
+            user_id=owner_id,
+            scan_id=scan_id,
+            status=_collection_status_for_scan(scan),
+        )
+        db.add(collection)
+        await db.commit()
+        await db.refresh(collection)
+
+    listing_result = await db.execute(select(ListingModel).where(ListingModel.scan_id == scan_id))
+    listing = listing_result.scalar_one_or_none()
+    item = _collection_item_response(collection, scan, listing)
+    await db.commit()
+    return item
+
+
+@app.get(
+    "/api/v1/collection/{scan_id}",
+    response_model=CollectionItemResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_collection_item(
+    scan_id: str,
+    user_id: str = Depends(resolve_user_id),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    query = (
+        select(CollectionItemModel, ScanModel, ListingModel)
+        .join(ScanModel, CollectionItemModel.scan_id == ScanModel.id)
+        .outerjoin(ListingModel, ListingModel.scan_id == ScanModel.id)
+        .where(CollectionItemModel.user_id == user_id, CollectionItemModel.scan_id == scan_id)
+    )
+    result = await db.execute(query)
+    row = result.first()
+
+    if not row:
+        raise AppProductionException("NOT_FOUND", "Pierre introuvable dans la collection.", 404)
+
+    collection, scan, listing = row
+    item = _collection_item_response(collection, scan, listing)
+    await db.commit()
+    return item
 
 @app.post(
     "/api/v1/marketplace/publish/{scan_id}",
