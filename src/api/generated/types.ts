@@ -258,8 +258,16 @@ export type ScanDecisionResponse = {
   "actions": ScanActions;
   "trigger_radar_admin": boolean;
   "metadata_applied": ScanMetadataApplied;
+  "message": ScanDiagnosticMessage;
   "scan_id": string;
   "is_sync_retry"?: boolean;
+};
+
+export type ScanDiagnosticMessage = {
+  "language": "ar" | "fr";
+  "tone": "success" | "warning" | "neutral";
+  "title": string;
+  "body": string;
 };
 
 export type ScanMetadataApplied = {
@@ -306,6 +314,7 @@ export type ApiSchemas = {
   "RegisterInput": RegisterInput;
   "ScanActions": ScanActions;
   "ScanDecisionResponse": ScanDecisionResponse;
+  "ScanDiagnosticMessage": ScanDiagnosticMessage;
   "ScanMetadataApplied": ScanMetadataApplied;
   "SubscriptionResponse": SubscriptionResponse;
 };

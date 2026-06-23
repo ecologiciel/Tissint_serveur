@@ -1759,6 +1759,22 @@
         "operationId": "scan_exterior_api_v1_scan_exterior_post",
         "parameters": [
           {
+            "name": "Accept-Language",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Accept-Language"
+            }
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": true,
@@ -1914,6 +1930,22 @@
             "schema": {
               "type": "string",
               "title": "Scan Id"
+            }
+          },
+          {
+            "name": "Accept-Language",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Accept-Language"
             }
           },
           {
@@ -5754,6 +5786,9 @@
           "metadata_applied": {
             "$ref": "#/components/schemas/ScanMetadataApplied"
           },
+          "message": {
+            "$ref": "#/components/schemas/ScanDiagnosticMessage"
+          },
           "scan_id": {
             "type": "string",
             "title": "Scan Id"
@@ -5774,9 +5809,47 @@
           "actions",
           "trigger_radar_admin",
           "metadata_applied",
+          "message",
           "scan_id"
         ],
         "title": "ScanDecisionResponse"
+      },
+      "ScanDiagnosticMessage": {
+        "properties": {
+          "language": {
+            "type": "string",
+            "enum": [
+              "ar",
+              "fr"
+            ],
+            "title": "Language"
+          },
+          "tone": {
+            "type": "string",
+            "enum": [
+              "success",
+              "warning",
+              "neutral"
+            ],
+            "title": "Tone"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "body": {
+            "type": "string",
+            "title": "Body"
+          }
+        },
+        "type": "object",
+        "required": [
+          "language",
+          "tone",
+          "title",
+          "body"
+        ],
+        "title": "ScanDiagnosticMessage"
       },
       "ScanMetadataApplied": {
         "properties": {

@@ -943,7 +943,8 @@ async def scan_exterior(
     longitude: Optional[float] = Form(None),
     subscription = Depends(check_scan_quota),
     db: AsyncSession = Depends(get_db),
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_api_key),
+    accept_language: Optional[str] = Header(None, alias="Accept-Language"),
 ):
     try:
         metadata = ScanMetadataInput(
@@ -963,23 +964,27 @@ async def scan_exterior(
     
     if existing_scan:
         print(f"🔄 [Idempotence] Scan existant récupéré pour client_uuid: {metadata.client_uuid}")
+        actions = business_orchestrator.build_scan_actions(existing_scan.status_code)
         return {
             "status_code": existing_scan.status_code,
             "is_meteorite": existing_scan.is_meteorite,
             "meteorite_probability": existing_scan.meteorite_probability,
             "dominant_class": existing_scan.dominant_class,
             "class_confidence": existing_scan.class_confidence,
-            "actions": {
-                "add_to_collection": existing_scan.status_code in ["DIAGNOSTIC_SUCCESS_HIGH", "DIAGNOSTIC_HESITANT"],
-                "enable_marketplace_button": existing_scan.status_code == "DIAGNOSTIC_SUCCESS_HIGH",
-                "invite_interior_cut": existing_scan.status_code != "DIAGNOSTIC_REJECTED"
-            },
+            "actions": actions,
             "trigger_radar_admin": False,
             "metadata_applied": {
                 "weight_provided": existing_scan.weight is not None,
                 "magnetic_status": existing_scan.magnetic,
                 "has_coordinates": existing_scan.latitude is not None and existing_scan.longitude is not None
             },
+            "message": business_orchestrator.build_message(
+                status_code=existing_scan.status_code,
+                dominant_class=existing_scan.dominant_class,
+                meteorite_probability=existing_scan.meteorite_probability,
+                actions=actions,
+                language=accept_language,
+            ),
             "scan_id": existing_scan.id,
             "is_sync_retry": True
         }
@@ -1035,7 +1040,7 @@ async def scan_exterior(
         )
         
         # 4. Orchestrateur Métier (Décision)
-        final_decision = business_orchestrator.evaluate_decision(fusion_results)
+        final_decision = business_orchestrator.evaluate_decision(fusion_results, language=accept_language)
 
     except Exception as e:
         raise AppProductionException("INTERNAL_PROCESSING_ERROR", f"Erreur de traitement IA: {str(e)}", 500)
@@ -1081,7 +1086,8 @@ async def scan_interior_update(
     scan_id: str,
     file_interior: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_api_key),
+    accept_language: Optional[str] = Header(None, alias="Accept-Language"),
 ):
     # 1. Récupération asynchrone du scan de la BDD
     result = await db.execute(select(ScanModel).where(ScanModel.id == scan_id))
@@ -1122,7 +1128,7 @@ async def scan_interior_update(
         magnetic=scan.magnetic
     )
 
-    final_decision = business_orchestrator.evaluate_decision(fusion_results)
+    final_decision = business_orchestrator.evaluate_decision(fusion_results, language=accept_language)
 
     # 5. Mise à jour du document en BDD
     # On force manuellement le json pour la mise a jour

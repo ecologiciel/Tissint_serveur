@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 class ApiError(BaseModel):
     code: str
@@ -74,6 +74,12 @@ class ScanMetadataApplied(BaseModel):
     magnetic_status: Optional[bool] = None
     has_coordinates: bool
 
+class ScanDiagnosticMessage(BaseModel):
+    language: Literal["ar", "fr"]
+    tone: Literal["success", "warning", "neutral"]
+    title: str
+    body: str
+
 class ScanDecisionResponse(BaseModel):
     status_code: str
     is_meteorite: bool
@@ -83,6 +89,7 @@ class ScanDecisionResponse(BaseModel):
     actions: ScanActions
     trigger_radar_admin: bool
     metadata_applied: ScanMetadataApplied
+    message: ScanDiagnosticMessage
     scan_id: str
     is_sync_retry: bool = False
 

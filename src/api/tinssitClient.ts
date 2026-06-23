@@ -27,9 +27,12 @@ export type TinssitUploadFile =
       type: string;
     };
 
+export type TinssitLanguage = 'ar' | 'fr';
+
 export type TinssitClientConfig = {
   baseUrl: string;
   apiKey: string;
+  language?: TinssitLanguage;
   fetchImpl?: typeof fetch;
   getAccessToken?: () => string | null | undefined | Promise<string | null | undefined>;
 };
@@ -43,6 +46,7 @@ export type ScanExteriorRequest = {
   magnetic?: boolean | null;
   latitude?: number | null;
   longitude?: number | null;
+  language?: TinssitLanguage;
 };
 
 export class TinssitApiError extends Error {
@@ -66,9 +70,13 @@ export function createTinssitClient(config: TinssitClientConfig) {
   async function requestJson<T>(
     path: string,
     init: RequestInit = {},
-    options: { auth?: boolean } = {},
+    options: { auth?: boolean; language?: TinssitLanguage } = {},
   ): Promise<T> {
     const headers = new Headers(init.headers);
+    const language = options.language ?? config.language;
+    if (language) {
+      headers.set('Accept-Language', language);
+    }
     if (options.auth !== false) {
       headers.set('X-API-Key', config.apiKey);
       const accessToken = await config.getAccessToken?.();
@@ -94,16 +102,28 @@ export function createTinssitClient(config: TinssitClientConfig) {
     health: () => requestJson<HealthResponse>('/health', {}, { auth: false }),
 
     scanExterior: (input: ScanExteriorRequest) =>
-      requestJson<ScanDecisionResponse>('/api/v1/scan/exterior', {
-        method: 'POST',
-        body: buildScanExteriorFormData(input),
-      }),
+      requestJson<ScanDecisionResponse>(
+        '/api/v1/scan/exterior',
+        {
+          method: 'POST',
+          body: buildScanExteriorFormData(input),
+        },
+        { language: input.language },
+      ),
 
-    scanInteriorUpdate: (scanId: string, fileInterior: TinssitUploadFile) =>
-      requestJson<ScanDecisionResponse>(`/api/v1/scan/${encodeURIComponent(scanId)}/interior`, {
-        method: 'PATCH',
-        body: buildSingleFileFormData('file_interior', fileInterior),
-      }),
+    scanInteriorUpdate: (
+      scanId: string,
+      fileInterior: TinssitUploadFile,
+      options: { language?: TinssitLanguage } = {},
+    ) =>
+      requestJson<ScanDecisionResponse>(
+        `/api/v1/scan/${encodeURIComponent(scanId)}/interior`,
+        {
+          method: 'PATCH',
+          body: buildSingleFileFormData('file_interior', fileInterior),
+        },
+        { language: options.language },
+      ),
 
     publishScanToMarketplace: (scanId: string, payload: PublishListingInput = {}) =>
       requestJson<MarketplaceListingResponse>(
