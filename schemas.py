@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, List
 
 class ApiError(BaseModel):
     code: str
@@ -109,6 +109,7 @@ class PublishListingInput(BaseModel):
         return value
 
 class MarketplaceListingResponse(BaseModel):
+    ok: bool = True
     status: str
     message: str
     listing_id: str
@@ -126,6 +127,9 @@ class MarketplaceListingResponse(BaseModel):
     blurred_latitude: Optional[float] = Field(None, description="Latitude floutée pour anonymisation (précision ~11km)")
     blurred_longitude: Optional[float] = Field(None, description="Longitude floutée pour anonymisation (précision ~11km)")
     contact_locked_until: Optional[str] = None
+    main_image_uri: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_uri: Optional[str] = None
 
 class PublicListingItem(BaseModel):
     listing_id: str
@@ -151,6 +155,9 @@ class PublicListingItem(BaseModel):
     can_contact: bool = False
     contact_lock_reason: Optional[str] = "premium_required"
     contact_locked_until: Optional[str] = None
+    main_image_uri: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_uri: Optional[str] = None
 
 class AdminRadarListingResponse(BaseModel):
     listing_id: str
@@ -176,11 +183,15 @@ class AdminRadarListingResponse(BaseModel):
     seller_phone: Optional[str] = None
     seller_email: Optional[str] = None
     seller_verified: bool = False
+    main_image_uri: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_uri: Optional[str] = None
 
 class AdminListingActionInput(BaseModel):
     reason: Optional[str] = Field(None, max_length=500)
 
 class AdminActionResponse(BaseModel):
+    ok: bool = True
     status: str
     message: str
     listing: AdminRadarListingResponse
@@ -257,7 +268,125 @@ class CollectionItemResponse(BaseModel):
     status: str
     created_at: str
     main_image_uri: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_uri: Optional[str] = None
+    weight_g: Optional[float] = None
+    region: Optional[str] = None
+    notes: Optional[str] = None
     meteorite_probability: Optional[float] = None
+
+class SendMessageInput(BaseModel):
+    listing_id: Optional[str] = Field(None, max_length=120)
+    thread_id: Optional[str] = Field(None, max_length=120)
+    text: str = Field(..., min_length=1, max_length=2000)
+
+class UiMessageResponse(BaseModel):
+    id: str
+    thread_id: str
+    from_me: bool
+    text: str
+    created_at: str
+
+class MessageThreadResponse(BaseModel):
+    id: str
+    listing_id: str
+    listing_title: Optional[str] = None
+    listing_image_uri: Optional[str] = None
+    peer_name: Optional[str] = None
+    peer_verified: bool = False
+    last_message: Optional[str] = None
+    last_at: Optional[str] = None
+    unread: int = 0
+
+class OkResponse(BaseModel):
+    ok: bool = True
+
+class NotificationResponse(BaseModel):
+    id: str
+    type: str
+    title: str
+    body: str
+    read: bool
+    created_at: str
+    action: Optional[str] = None
+
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+class PushSubscribeInput(BaseModel):
+    endpoint: str = Field(..., min_length=10, max_length=2000)
+    keys: PushSubscriptionKeys
+
+class PushSubscribeResponse(BaseModel):
+    subscribed: bool
+
+class RatingInput(BaseModel):
+    listing_id: str
+    seller_id: str
+    stars: int = Field(..., ge=1, le=5)
+    comment: Optional[str] = Field(None, max_length=1000)
+
+class RatingResponse(BaseModel):
+    id: str
+    ok: bool = True
+
+class SellerProfileResponse(BaseModel):
+    id: str
+    name: Optional[str] = None
+    average_rating: float = 0.0
+    total_ratings: int = 0
+    listings: List[PublicListingItem] = Field(default_factory=list)
+
+class WalletTransactionResponse(BaseModel):
+    id: str
+    type: str
+    amount: float
+    fee: float
+    net: float
+    desc: Optional[str] = None
+    created_at: str
+    status: str
+
+class WalletResponse(BaseModel):
+    balance: float
+    currency: str = "MAD"
+    transactions: List[WalletTransactionResponse] = Field(default_factory=list)
+
+class WithdrawInput(BaseModel):
+    amount: float = Field(..., gt=0)
+    iban: str = Field(..., min_length=8, max_length=80)
+
+class WithdrawResponse(BaseModel):
+    request_id: str
+    status: str
+    estimated_days: int = 2
+
+class MarketplaceSearchInput(BaseModel):
+    query: Optional[str] = Field(None, max_length=120)
+    region: Optional[str] = Field(None, max_length=120)
+    price_min: Optional[float] = Field(None, ge=0)
+    price_max: Optional[float] = Field(None, ge=0)
+    classification: Optional[str] = Field(None, max_length=120)
+
+class MarketplaceTrendingItem(BaseModel):
+    classification: str
+    change_percent: float = 0.0
+    avg_price: float = 0.0
+
+class MarketplaceRegionVolume(BaseModel):
+    region: str
+    count: int
+    pct: float
+
+class MarketplaceStatsResponse(BaseModel):
+    total_listings: int
+    total_sales: int
+    avg_price_dh: float
+    trending: List[MarketplaceTrendingItem] = Field(default_factory=list)
+    volume_by_region: List[MarketplaceRegionVolume] = Field(default_factory=list)
+    price_history: dict[str, List[float]] = Field(default_factory=dict)
+    months: List[str] = Field(default_factory=list)
 
 class CreateMessageInput(BaseModel):
     conversation_id: str = Field(..., description="ID unique de la conversation")

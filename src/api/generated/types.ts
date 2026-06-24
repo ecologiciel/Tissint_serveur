@@ -2,6 +2,7 @@
 // Do not edit by hand. Update docs/openapi.json, then regenerate.
 
 export type AdminActionResponse = {
+  "ok"?: boolean;
   "status": string;
   "message": string;
   "listing": AdminRadarListingResponse;
@@ -35,6 +36,9 @@ export type AdminRadarListingResponse = {
   "seller_phone"?: string | null;
   "seller_email"?: string | null;
   "seller_verified"?: boolean;
+  "main_image_uri"?: string | null;
+  "image_url"?: string | null;
+  "thumbnail_uri"?: string | null;
 };
 
 export type ApiError = {
@@ -122,6 +126,11 @@ export type CollectionItemResponse = {
   "status": string;
   "created_at": string;
   "main_image_uri"?: string | null;
+  "image_url"?: string | null;
+  "thumbnail_uri"?: string | null;
+  "weight_g"?: number | null;
+  "region"?: string | null;
+  "notes"?: string | null;
   "meteorite_probability"?: number | null;
 };
 
@@ -160,6 +169,7 @@ export type LogoutInput = {
 };
 
 export type MarketplaceListingResponse = {
+  "ok"?: boolean;
   "status": string;
   "message": string;
   "listing_id": string;
@@ -177,6 +187,39 @@ export type MarketplaceListingResponse = {
   "blurred_latitude"?: number | null;
   "blurred_longitude"?: number | null;
   "contact_locked_until"?: string | null;
+  "main_image_uri"?: string | null;
+  "image_url"?: string | null;
+  "thumbnail_uri"?: string | null;
+};
+
+export type MarketplaceRegionVolume = {
+  "region": string;
+  "count": number;
+  "pct": number;
+};
+
+export type MarketplaceSearchInput = {
+  "query"?: string | null;
+  "region"?: string | null;
+  "price_min"?: number | null;
+  "price_max"?: number | null;
+  "classification"?: string | null;
+};
+
+export type MarketplaceStatsResponse = {
+  "total_listings": number;
+  "total_sales": number;
+  "avg_price_dh": number;
+  "trending"?: MarketplaceTrendingItem[];
+  "volume_by_region"?: MarketplaceRegionVolume[];
+  "price_history"?: Record<string, number[]>;
+  "months"?: string[];
+};
+
+export type MarketplaceTrendingItem = {
+  "classification": string;
+  "change_percent"?: number;
+  "avg_price"?: number;
 };
 
 export type MessageResponse = {
@@ -186,6 +229,32 @@ export type MessageResponse = {
   "receiver_id": string;
   "text_content": string;
   "timestamp": string;
+};
+
+export type MessageThreadResponse = {
+  "id": string;
+  "listing_id": string;
+  "listing_title"?: string | null;
+  "listing_image_uri"?: string | null;
+  "peer_name"?: string | null;
+  "peer_verified"?: boolean;
+  "last_message"?: string | null;
+  "last_at"?: string | null;
+  "unread"?: number;
+};
+
+export type NotificationResponse = {
+  "id": string;
+  "type": string;
+  "title": string;
+  "body": string;
+  "read": boolean;
+  "created_at": string;
+  "action"?: string | null;
+};
+
+export type OkResponse = {
+  "ok"?: boolean;
 };
 
 export type PublicListingItem = {
@@ -212,6 +281,9 @@ export type PublicListingItem = {
   "can_contact"?: boolean;
   "contact_lock_reason"?: string | null;
   "contact_locked_until"?: string | null;
+  "main_image_uri"?: string | null;
+  "image_url"?: string | null;
+  "thumbnail_uri"?: string | null;
 };
 
 export type PublishListingInput = {
@@ -222,11 +294,37 @@ export type PublishListingInput = {
   "region"?: string | null;
 };
 
+export type PushSubscribeInput = {
+  "endpoint": string;
+  "keys": PushSubscriptionKeys;
+};
+
+export type PushSubscribeResponse = {
+  "subscribed": boolean;
+};
+
+export type PushSubscriptionKeys = {
+  "p256dh": string;
+  "auth": string;
+};
+
 export type QuotaResponse = {
   "role": string;
   "daily_limit": number;
   "remaining_today": number;
   "resets_at"?: string | null;
+};
+
+export type RatingInput = {
+  "listing_id": string;
+  "seller_id": string;
+  "stars": number;
+  "comment"?: string | null;
+};
+
+export type RatingResponse = {
+  "id": string;
+  "ok"?: boolean;
 };
 
 export type RefreshTokenInput = {
@@ -276,6 +374,20 @@ export type ScanMetadataApplied = {
   "has_coordinates": boolean;
 };
 
+export type SellerProfileResponse = {
+  "id": string;
+  "name"?: string | null;
+  "average_rating"?: number;
+  "total_ratings"?: number;
+  "listings"?: PublicListingItem[];
+};
+
+export type SendMessageInput = {
+  "listing_id"?: string | null;
+  "thread_id"?: string | null;
+  "text": string;
+};
+
 export type SubscriptionResponse = {
   "status": string;
   "role": string;
@@ -283,6 +395,42 @@ export type SubscriptionResponse = {
   "plan"?: string | null;
   "renews_at"?: string | null;
   "cancels_at"?: string | null;
+};
+
+export type UiMessageResponse = {
+  "id": string;
+  "thread_id": string;
+  "from_me": boolean;
+  "text": string;
+  "created_at": string;
+};
+
+export type WalletResponse = {
+  "balance": number;
+  "currency"?: string;
+  "transactions"?: WalletTransactionResponse[];
+};
+
+export type WalletTransactionResponse = {
+  "id": string;
+  "type": string;
+  "amount": number;
+  "fee": number;
+  "net": number;
+  "desc"?: string | null;
+  "created_at": string;
+  "status": string;
+};
+
+export type WithdrawInput = {
+  "amount": number;
+  "iban": string;
+};
+
+export type WithdrawResponse = {
+  "request_id": string;
+  "status": string;
+  "estimated_days"?: number;
 };
 
 export type ApiSchemas = {
@@ -306,15 +454,34 @@ export type ApiSchemas = {
   "LoginInput": LoginInput;
   "LogoutInput": LogoutInput;
   "MarketplaceListingResponse": MarketplaceListingResponse;
+  "MarketplaceRegionVolume": MarketplaceRegionVolume;
+  "MarketplaceSearchInput": MarketplaceSearchInput;
+  "MarketplaceStatsResponse": MarketplaceStatsResponse;
+  "MarketplaceTrendingItem": MarketplaceTrendingItem;
   "MessageResponse": MessageResponse;
+  "MessageThreadResponse": MessageThreadResponse;
+  "NotificationResponse": NotificationResponse;
+  "OkResponse": OkResponse;
   "PublicListingItem": PublicListingItem;
   "PublishListingInput": PublishListingInput;
+  "PushSubscribeInput": PushSubscribeInput;
+  "PushSubscribeResponse": PushSubscribeResponse;
+  "PushSubscriptionKeys": PushSubscriptionKeys;
   "QuotaResponse": QuotaResponse;
+  "RatingInput": RatingInput;
+  "RatingResponse": RatingResponse;
   "RefreshTokenInput": RefreshTokenInput;
   "RegisterInput": RegisterInput;
   "ScanActions": ScanActions;
   "ScanDecisionResponse": ScanDecisionResponse;
   "ScanDiagnosticMessage": ScanDiagnosticMessage;
   "ScanMetadataApplied": ScanMetadataApplied;
+  "SellerProfileResponse": SellerProfileResponse;
+  "SendMessageInput": SendMessageInput;
   "SubscriptionResponse": SubscriptionResponse;
+  "UiMessageResponse": UiMessageResponse;
+  "WalletResponse": WalletResponse;
+  "WalletTransactionResponse": WalletTransactionResponse;
+  "WithdrawInput": WithdrawInput;
+  "WithdrawResponse": WithdrawResponse;
 };

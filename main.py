@@ -16,6 +16,7 @@ from sqlalchemy import or_, text
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.staticfiles import StaticFiles
 
 from exceptions import (
     AppProductionException,
@@ -48,8 +49,24 @@ from schemas import (
     CheckoutSessionResponse,
     CreateMessageInput,
     InvoiceResponse,
+    MarketplaceSearchInput,
+    MarketplaceStatsResponse,
+    MessageThreadResponse,
     MessageResponse,
+    NotificationResponse,
+    OkResponse,
+    PushSubscribeInput,
+    PushSubscribeResponse,
+    RatingInput,
+    RatingResponse,
+    SellerProfileResponse,
+    SendMessageInput,
     SubscriptionResponse,
+    UiMessageResponse,
+    WalletResponse,
+    WalletTransactionResponse,
+    WithdrawInput,
+    WithdrawResponse,
 )
 from security import create_token, hash_password, hash_token, verify_api_key, verify_password, validate_upload_file
 from app.services.notifier import send_telegram_radar_alert
@@ -89,12 +106,20 @@ from database import (
     ListingModel,
     CollectionItemModel,
     MessageModel,
+    MessageThreadModel,
+    FavoriteModel,
+    NotificationModel,
+    PushSubscriptionModel,
+    SellerRatingModel,
+    WalletAccountModel,
+    WalletTransactionModel,
+    WithdrawalRequestModel,
     AuditLogModel,
     BillingCheckoutSessionModel,
     BillingEventModel,
     InvoiceModel,
 )
-from storage import storage_provider
+from storage import storage_provider, UPLOAD_DIR
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -125,18 +150,25 @@ app = FastAPI(
     description="Back-end expert d'identification avec gestion flexible des flux multimédias",
     lifespan=lifespan
 )
-cors_origins = [
-    origin.strip()
-    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
-    if origin.strip()
-]
+configured_cors = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+cors_origins = (
+    [origin.strip() for origin in configured_cors.split(",") if origin.strip() and origin.strip() != "*"]
+    if configured_cors
+    else ["null"]
+)
+cors_origin_regex = os.getenv(
+    "CORS_ALLOWED_ORIGIN_REGEX",
+    r"https://.*\.claudeusercontent\.com|https://.*\.claude\.site|https://claude\.ai|http://localhost(:\d+)?|http://127\.0\.0\.1(:\d+)?",
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins or ["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_origins=cors_origins or ["null"],
+    allow_origin_regex=cors_origin_regex,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+app.mount("/storage", StaticFiles(directory=UPLOAD_DIR), name="storage")
 app.add_exception_handler(AppProductionException, app_exception_handler)
 app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -685,6 +717,67 @@ def _blur_coordinates(scan: ScanModel):
     safe_lon = round(scan.longitude, 1) if scan.longitude is not None else None
     return safe_lat, safe_lon
 
+def _scan_main_image_uri(scan: ScanModel) -> Optional[str]:
+    if scan.exterior_images_paths:
+        return storage_provider.public_url(scan.exterior_images_paths[0])
+    return None
+
+def _scan_thumbnail_uri(scan: ScanModel) -> Optional[str]:
+    return _scan_main_image_uri(scan)
+
+def _listing_image_fields(scan: ScanModel) -> dict:
+    main_image_uri = _scan_main_image_uri(scan)
+    return {
+        "main_image_uri": main_image_uri,
+        "image_url": main_image_uri,
+        "thumbnail_uri": _scan_thumbnail_uri(scan),
+    }
+
+async def _create_notification(
+    db: AsyncSession,
+    user_id: str,
+    type_value: str,
+    title: str,
+    body: str,
+    action: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> NotificationModel:
+    notification = NotificationModel(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        type=type_value,
+        title=title,
+        body=body,
+        action=action,
+        event_metadata=metadata,
+    )
+    db.add(notification)
+    return notification
+
+async def _send_push_to_user(db: AsyncSession, user_id: str, payload: dict) -> None:
+    vapid_private_key = os.getenv("VAPID_PRIVATE_KEY")
+    vapid_contact = os.getenv("VAPID_CONTACT", "mailto:contact@tissint.ma")
+    if not vapid_private_key:
+        return
+
+    try:
+        from pywebpush import WebPushException, webpush
+    except Exception:
+        return
+
+    result = await db.execute(select(PushSubscriptionModel).where(PushSubscriptionModel.user_id == user_id))
+    subscriptions = result.scalars().all()
+    for subscription in subscriptions:
+        try:
+            webpush(
+                subscription_info={"endpoint": subscription.endpoint, "keys": subscription.keys},
+                data=json.dumps(payload),
+                vapid_private_key=vapid_private_key,
+                vapid_claims={"sub": vapid_contact},
+            )
+        except WebPushException:
+            continue
+
 def _is_rare_candidate(dominant_class: str, confidence: float) -> bool:
     rare_classes = ["Achondrite", "Carbonee", "Martian", "Lunar", "Pallasite", "Iron", "Metallique"]
     return dominant_class in rare_classes and confidence >= 0.85
@@ -819,6 +912,7 @@ def _admin_radar_listing_response(
     seller: Optional[UserModel],
 ) -> AdminRadarListingResponse:
     hold_until = _listing_hold_until(listing)
+    image_fields = _listing_image_fields(scan)
     return AdminRadarListingResponse(
         listing_id=listing.id,
         scan_id=scan.id,
@@ -843,6 +937,7 @@ def _admin_radar_listing_response(
         seller_phone=seller.phone if seller else None,
         seller_email=seller.email if seller else None,
         seller_verified=seller is not None,
+        **image_fields,
     )
 
 def _public_listing_item(
@@ -856,6 +951,7 @@ def _public_listing_item(
     can_contact = _can_contact_listing(viewer_role, status_value)
     contact_locked_until = _listing_hold_until(listing)
     seller_phone = seller.phone if seller and can_contact else None
+    image_fields = _listing_image_fields(scan)
     return PublicListingItem(
         listing_id=listing.id,
         scan_id=scan.id,
@@ -880,6 +976,7 @@ def _public_listing_item(
         can_contact=can_contact,
         contact_lock_reason=_contact_lock_reason(viewer_role, status_value),
         contact_locked_until=contact_locked_until.isoformat() if contact_locked_until else None,
+        **image_fields,
     )
 
 def _collection_status_for_scan(scan: ScanModel, listing: Optional[ListingModel] = None) -> str:
@@ -903,9 +1000,7 @@ def _collection_item_response(
     status_value = _collection_status_for_scan(scan, listing)
     if collection.status != status_value:
         collection.status = status_value
-    main_image_uri = None
-    if scan.exterior_images_paths:
-        main_image_uri = scan.exterior_images_paths[0]
+    image_fields = _listing_image_fields(scan)
 
     return CollectionItemResponse(
         id=collection.id,
@@ -914,8 +1009,11 @@ def _collection_item_response(
         fusion_score=scan.meteorite_probability,
         status=status_value,
         created_at=collection.created_at.isoformat() if collection.created_at else "",
-        main_image_uri=main_image_uri,
+        weight_g=scan.weight,
+        region=listing.region if listing else None,
+        notes=listing.description if listing else None,
         meteorite_probability=scan.meteorite_probability,
+        **image_fields,
     )
 
 async def _sync_collection_status_for_listing(
@@ -1066,13 +1164,42 @@ async def scan_exterior(
     )
     
     db.add(new_scan)
+    await _create_notification(
+        db,
+        user_id=metadata.user_id,
+        type_value="scan_ready",
+        title="نتيجة المسح جاهزة",
+        body=f"{final_decision['dominant_class']} - {final_decision['meteorite_probability'] * 100:.1f}/100",
+        action="scanResult",
+        metadata={"scan_id": scan_id},
+    )
     await db.commit()
 
     # Déduction du quota pour le scan d'IA (uniquement flux nominal, pas en cas d'idempotence)
     await decrement_quota(subscription.user_id, db)
+    refreshed_subscription = await get_or_create_subscription(subscription.user_id, db)
+    if refreshed_subscription.tier == "free" and refreshed_subscription.remaining_tokens <= 1:
+        await _create_notification(
+            db,
+            user_id=metadata.user_id,
+            type_value="quota_warning",
+            title="Quota bientôt épuisé",
+            body=f"Il vous reste {refreshed_subscription.remaining_tokens} scan gratuit.",
+            action="premium",
+        )
+        await db.commit()
 
     # Ajout du scan_id et des infos à la réponse
     final_decision["scan_id"] = scan_id
+    await _send_push_to_user(
+        db,
+        metadata.user_id,
+        {
+            "title": "نتيجة المسح جاهزة",
+            "body": f"نقاط: {final_decision['meteorite_probability'] * 100:.1f}/100 - {final_decision['dominant_class']}",
+            "data": {"action": "scanResult", "scan_id": scan_id},
+        },
+    )
 
     return final_decision
 
@@ -1140,9 +1267,27 @@ async def scan_interior_update(
     scan.dominant_class = final_decision["dominant_class"]
     scan.class_confidence = final_decision["class_confidence"]
 
+    await _create_notification(
+        db,
+        user_id=scan.user_id,
+        type_value="scan_ready",
+        title="نتيجة المسح جاهزة",
+        body=f"{final_decision['dominant_class']} - {final_decision['meteorite_probability'] * 100:.1f}/100",
+        action="scanResult",
+        metadata={"scan_id": scan_id},
+    )
     await db.commit()
     
     final_decision["scan_id"] = scan_id
+    await _send_push_to_user(
+        db,
+        scan.user_id,
+        {
+            "title": "نتيجة المسح جاهزة",
+            "body": f"نقاط: {final_decision['meteorite_probability'] * 100:.1f}/100 - {final_decision['dominant_class']}",
+            "data": {"action": "scanResult", "scan_id": scan_id},
+        },
+    )
     
     return final_decision
 
@@ -1358,6 +1503,7 @@ async def publish_to_marketplace(
     # Security: Anonymisation & Floutage (Arrondi d'une décimale pour une précision régionale protectrice d'environ ~11km)
     safe_lat, safe_lon = _blur_coordinates(scan)
     contact_locked_until = _listing_hold_until(listing)
+    image_fields = _listing_image_fields(scan)
 
     return MarketplaceListingResponse(
         status=listing.status,
@@ -1377,6 +1523,7 @@ async def publish_to_marketplace(
         blurred_latitude=safe_lat,
         blurred_longitude=safe_lon,
         contact_locked_until=contact_locked_until.isoformat() if contact_locked_until else None,
+        **image_fields,
     )
 
 
@@ -1649,6 +1796,722 @@ async def list_admin_audit_logs(
     query = query.order_by(AuditLogModel.created_at.desc()).limit(limit)
     result = await db.execute(query)
     return [_audit_log_response(log) for log in result.scalars().all()]
+
+
+@app.post(
+    "/api/v1/messages",
+    response_model=UiMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def create_ui_message(
+    payload: SendMessageInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    text_content = payload.text.strip()
+    if not text_content:
+        raise AppProductionException("VALIDATION_ERROR", "Message vide.", 400)
+
+    thread = None
+    listing = None
+    scan = None
+    receiver_id = None
+
+    if payload.thread_id:
+        thread_result = await db.execute(select(MessageThreadModel).where(MessageThreadModel.id == payload.thread_id))
+        thread = thread_result.scalar_one_or_none()
+        if not thread or user.id not in {thread.buyer_id, thread.seller_id}:
+            raise AppProductionException("NOT_FOUND", "Conversation introuvable.", 404)
+        receiver_id = thread.seller_id if user.id == thread.buyer_id else thread.buyer_id
+        listing_result = await db.execute(
+            select(ListingModel, ScanModel)
+            .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+            .where(ListingModel.id == thread.listing_id)
+        )
+        listing_row = listing_result.first()
+        if not listing_row:
+            raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+        listing, scan = listing_row
+    elif payload.listing_id:
+        listing_result = await db.execute(
+            select(ListingModel, ScanModel)
+            .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+            .where(ListingModel.id == payload.listing_id)
+        )
+        listing_row = listing_result.first()
+        if not listing_row:
+            raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+        listing, scan = listing_row
+        if scan.user_id == user.id:
+            raise AppProductionException("CONFLICT", "Le vendeur ne peut pas demarrer une conversation acheteur.", 409)
+        receiver_id = scan.user_id
+        thread_result = await db.execute(
+            select(MessageThreadModel).where(
+                MessageThreadModel.listing_id == listing.id,
+                MessageThreadModel.buyer_id == user.id,
+                MessageThreadModel.seller_id == scan.user_id,
+            )
+        )
+        thread = thread_result.scalar_one_or_none()
+        if not thread:
+            thread = MessageThreadModel(
+                id=str(uuid.uuid4()),
+                listing_id=listing.id,
+                buyer_id=user.id,
+                seller_id=scan.user_id,
+                unread_for_buyer=0,
+                unread_for_seller=0,
+            )
+            db.add(thread)
+    else:
+        raise AppProductionException("VALIDATION_ERROR", "listing_id ou thread_id est requis.", 400)
+
+    now = _utc_now()
+    thread.updated_at = now
+    if receiver_id == thread.buyer_id:
+        thread.unread_for_buyer += 1
+    else:
+        thread.unread_for_seller += 1
+
+    message = MessageModel(
+        id=str(uuid.uuid4()),
+        conversation_id=thread.id,
+        sender_id=user.id,
+        receiver_id=receiver_id,
+        text_content=text_content,
+        timestamp=now,
+    )
+    db.add(message)
+    await _create_notification(
+        db,
+        user_id=receiver_id,
+        type_value="message",
+        title="Nouveau message",
+        body=text_content[:180],
+        action="messages",
+        metadata={"thread_id": thread.id, "listing_id": listing.id if listing else thread.listing_id},
+    )
+    await db.commit()
+    await db.refresh(message)
+    await _send_push_to_user(
+        db,
+        receiver_id,
+        {"title": "Nouveau message", "body": text_content[:180], "data": {"action": "messages", "thread_id": thread.id}},
+    )
+
+    return UiMessageResponse(
+        id=message.id,
+        thread_id=thread.id,
+        from_me=True,
+        text=message.text_content,
+        created_at=message.timestamp.isoformat() if message.timestamp else "",
+    )
+
+
+@app.get(
+    "/api/v1/messages",
+    response_model=List[MessageThreadResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def list_ui_message_threads(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    result = await db.execute(
+        select(MessageThreadModel)
+        .where(or_(MessageThreadModel.buyer_id == user.id, MessageThreadModel.seller_id == user.id))
+        .order_by(MessageThreadModel.updated_at.desc())
+    )
+    threads = result.scalars().all()
+
+    responses = []
+    for thread in threads:
+        listing_result = await db.execute(
+            select(ListingModel, ScanModel)
+            .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+            .where(ListingModel.id == thread.listing_id)
+        )
+        listing_row = listing_result.first()
+        if not listing_row:
+            continue
+        listing, scan = listing_row
+        peer_id = thread.seller_id if user.id == thread.buyer_id else thread.buyer_id
+        peer_result = await db.execute(select(UserModel).where(UserModel.id == peer_id))
+        peer = peer_result.scalar_one_or_none()
+        last_result = await db.execute(
+            select(MessageModel)
+            .where(MessageModel.conversation_id == thread.id)
+            .order_by(MessageModel.timestamp.desc())
+            .limit(1)
+        )
+        last_message = last_result.scalar_one_or_none()
+        unread = thread.unread_for_buyer if user.id == thread.buyer_id else thread.unread_for_seller
+        responses.append(
+            MessageThreadResponse(
+                id=thread.id,
+                listing_id=thread.listing_id,
+                listing_title=listing.title or scan.dominant_class,
+                listing_image_uri=_scan_main_image_uri(scan),
+                peer_name=_seller_full_name(peer) or _seller_masked_name(peer),
+                peer_verified=peer is not None,
+                last_message=last_message.text_content if last_message else None,
+                last_at=last_message.timestamp.isoformat() if last_message and last_message.timestamp else None,
+                unread=unread,
+            )
+        )
+    return responses
+
+
+@app.get(
+    "/api/v1/messages/{thread_id}",
+    response_model=List[UiMessageResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_ui_message_thread(
+    thread_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    thread_result = await db.execute(select(MessageThreadModel).where(MessageThreadModel.id == thread_id))
+    thread = thread_result.scalar_one_or_none()
+    if not thread or user.id not in {thread.buyer_id, thread.seller_id}:
+        raise AppProductionException("NOT_FOUND", "Conversation introuvable.", 404)
+
+    if user.id == thread.buyer_id:
+        thread.unread_for_buyer = 0
+    else:
+        thread.unread_for_seller = 0
+
+    result = await db.execute(
+        select(MessageModel)
+        .where(MessageModel.conversation_id == thread.id)
+        .order_by(MessageModel.timestamp.asc())
+    )
+    messages = result.scalars().all()
+    await db.commit()
+    return [
+        UiMessageResponse(
+            id=message.id,
+            thread_id=thread.id,
+            from_me=message.sender_id == user.id,
+            text=message.text_content,
+            created_at=message.timestamp.isoformat() if message.timestamp else "",
+        )
+        for message in messages
+    ]
+
+
+@app.get(
+    "/api/v1/favorites",
+    response_model=List[PublicListingItem],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def list_favorites(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    viewer_role = subscription.tier
+    result = await db.execute(
+        select(FavoriteModel, ListingModel, ScanModel, UserModel)
+        .join(ListingModel, FavoriteModel.listing_id == ListingModel.id)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(FavoriteModel.user_id == user.id)
+        .order_by(FavoriteModel.created_at.desc())
+    )
+    return [
+        _public_listing_item(listing, scan, seller, viewer_role)
+        for _favorite, listing, scan, seller in result.all()
+        if _effective_listing_status(listing) in MARKETPLACE_VISIBLE_STATUSES
+    ]
+
+
+@app.post(
+    "/api/v1/favorites/{listing_id}",
+    response_model=OkResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def add_favorite(
+    listing_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    listing_result = await db.execute(select(ListingModel).where(ListingModel.id == listing_id))
+    if not listing_result.scalar_one_or_none():
+        raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+    favorite_result = await db.execute(
+        select(FavoriteModel).where(FavoriteModel.user_id == user.id, FavoriteModel.listing_id == listing_id)
+    )
+    if not favorite_result.scalar_one_or_none():
+        db.add(FavoriteModel(id=str(uuid.uuid4()), user_id=user.id, listing_id=listing_id))
+        await db.commit()
+    return OkResponse(ok=True)
+
+
+@app.delete(
+    "/api/v1/favorites/{listing_id}",
+    response_model=OkResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def delete_favorite(
+    listing_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    favorite_result = await db.execute(
+        select(FavoriteModel).where(FavoriteModel.user_id == user.id, FavoriteModel.listing_id == listing_id)
+    )
+    favorite = favorite_result.scalar_one_or_none()
+    if favorite:
+        await db.delete(favorite)
+        await db.commit()
+    return OkResponse(ok=True)
+
+
+@app.get(
+    "/api/v1/notifications",
+    response_model=List[NotificationResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def list_notifications(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    result = await db.execute(
+        select(NotificationModel)
+        .where(NotificationModel.user_id == user.id)
+        .order_by(NotificationModel.created_at.desc())
+        .limit(100)
+    )
+    return [
+        NotificationResponse(
+            id=notification.id,
+            type=notification.type,
+            title=notification.title,
+            body=notification.body,
+            read=notification.read,
+            created_at=notification.created_at.isoformat() if notification.created_at else "",
+            action=notification.action,
+        )
+        for notification in result.scalars().all()
+    ]
+
+
+@app.patch(
+    "/api/v1/notifications/{notification_id}/read",
+    response_model=OkResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def mark_notification_read(
+    notification_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    result = await db.execute(
+        select(NotificationModel).where(NotificationModel.id == notification_id, NotificationModel.user_id == user.id)
+    )
+    notification = result.scalar_one_or_none()
+    if not notification:
+        raise AppProductionException("NOT_FOUND", "Notification introuvable.", 404)
+    notification.read = True
+    await db.commit()
+    return OkResponse(ok=True)
+
+
+@app.post(
+    "/api/v1/notifications/read-all",
+    response_model=OkResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def mark_all_notifications_read(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    result = await db.execute(select(NotificationModel).where(NotificationModel.user_id == user.id))
+    for notification in result.scalars().all():
+        notification.read = True
+    await db.commit()
+    return OkResponse(ok=True)
+
+
+@app.post(
+    "/api/v1/notifications/push-subscribe",
+    response_model=PushSubscribeResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def push_subscribe(
+    payload: PushSubscribeInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    result = await db.execute(select(PushSubscriptionModel).where(PushSubscriptionModel.endpoint == payload.endpoint))
+    subscription = result.scalar_one_or_none()
+    if subscription:
+        subscription.user_id = user.id
+        subscription.keys = payload.keys.model_dump()
+        subscription.updated_at = _utc_now()
+    else:
+        db.add(
+            PushSubscriptionModel(
+                id=str(uuid.uuid4()),
+                user_id=user.id,
+                endpoint=payload.endpoint,
+                keys=payload.keys.model_dump(),
+            )
+        )
+    await db.commit()
+    return PushSubscribeResponse(subscribed=True)
+
+
+@app.post(
+    "/api/v1/ratings",
+    response_model=RatingResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def rate_seller(
+    payload: RatingInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    row_result = await db.execute(
+        select(ListingModel, ScanModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .where(ListingModel.id == payload.listing_id)
+    )
+    row = row_result.first()
+    if not row:
+        raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+    listing, scan = row
+    if scan.user_id != payload.seller_id:
+        raise AppProductionException("VALIDATION_ERROR", "Vendeur invalide pour cette annonce.", 400)
+    if user.id == payload.seller_id:
+        raise AppProductionException("CONFLICT", "Un vendeur ne peut pas se noter lui-meme.", 409)
+
+    existing_result = await db.execute(
+        select(SellerRatingModel).where(SellerRatingModel.listing_id == listing.id, SellerRatingModel.buyer_id == user.id)
+    )
+    rating = existing_result.scalar_one_or_none()
+    if rating:
+        rating.stars = payload.stars
+        rating.comment = payload.comment
+    else:
+        rating = SellerRatingModel(
+            id=str(uuid.uuid4()),
+            listing_id=listing.id,
+            seller_id=payload.seller_id,
+            buyer_id=user.id,
+            stars=payload.stars,
+            comment=payload.comment,
+        )
+        db.add(rating)
+    await db.commit()
+    await db.refresh(rating)
+    return RatingResponse(id=rating.id, ok=True)
+
+
+@app.get(
+    "/api/v1/sellers/{seller_id_or_name}",
+    response_model=SellerProfileResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_seller_profile(
+    seller_id_or_name: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    _viewer_user, viewer_subscription = await _optional_auth_context(authorization, db)
+    viewer_role = viewer_subscription.tier if viewer_subscription else "guest"
+    like_value = f"%{seller_id_or_name}%"
+    seller_result = await db.execute(
+        select(UserModel).where(
+            or_(
+                UserModel.id == seller_id_or_name,
+                UserModel.phone == seller_id_or_name,
+                UserModel.email == seller_id_or_name,
+                UserModel.first_name.ilike(like_value),
+                UserModel.last_name.ilike(like_value),
+            )
+        ).limit(1)
+    )
+    seller = seller_result.scalars().first()
+    if not seller:
+        raise AppProductionException("NOT_FOUND", "Vendeur introuvable.", 404)
+
+    ratings_result = await db.execute(select(SellerRatingModel).where(SellerRatingModel.seller_id == seller.id))
+    ratings = ratings_result.scalars().all()
+    average_rating = round(sum(rating.stars for rating in ratings) / len(ratings), 2) if ratings else 0.0
+
+    listings_result = await db.execute(
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(ScanModel.user_id == seller.id, ListingModel.status.in_(list(MARKETPLACE_VISIBLE_STATUSES)))
+        .order_by(ListingModel.created_at.desc())
+    )
+    listings = [
+        _public_listing_item(listing, scan, listing_seller, viewer_role)
+        for listing, scan, listing_seller in listings_result.all()
+    ]
+    return SellerProfileResponse(
+        id=seller.id,
+        name=_seller_full_name(seller),
+        average_rating=average_rating,
+        total_ratings=len(ratings),
+        listings=listings,
+    )
+
+
+async def _wallet_account_for_user(user_id: str, db: AsyncSession) -> WalletAccountModel:
+    result = await db.execute(select(WalletAccountModel).where(WalletAccountModel.user_id == user_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        account = WalletAccountModel(user_id=user_id, balance=0.0, currency="MAD")
+        db.add(account)
+        await db.flush()
+    return account
+
+
+@app.get(
+    "/api/v1/wallet",
+    response_model=WalletResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_wallet(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    account = await _wallet_account_for_user(user.id, db)
+    tx_result = await db.execute(
+        select(WalletTransactionModel)
+        .where(WalletTransactionModel.user_id == user.id)
+        .order_by(WalletTransactionModel.created_at.desc())
+        .limit(100)
+    )
+    transactions = [
+        WalletTransactionResponse(
+            id=tx.id,
+            type=tx.type,
+            amount=tx.amount,
+            fee=tx.fee,
+            net=tx.net,
+            desc=tx.desc,
+            created_at=tx.created_at.isoformat() if tx.created_at else "",
+            status=tx.status,
+        )
+        for tx in tx_result.scalars().all()
+    ]
+    await db.commit()
+    return WalletResponse(balance=account.balance, currency=account.currency, transactions=transactions)
+
+
+@app.post(
+    "/api/v1/wallet/withdraw",
+    response_model=WithdrawResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def withdraw_wallet(
+    payload: WithdrawInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, _subscription, _token = await _current_auth_context(authorization, db)
+    account = await _wallet_account_for_user(user.id, db)
+    if payload.amount > account.balance:
+        raise AppProductionException("INSUFFICIENT_FUNDS", "Solde insuffisant.", 409)
+    fee = round(payload.amount * 0.02, 2)
+    net = round(payload.amount - fee, 2)
+    account.balance = round(account.balance - payload.amount, 2)
+    account.updated_at = _utc_now()
+    withdrawal = WithdrawalRequestModel(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        amount=payload.amount,
+        iban=payload.iban,
+        status="processing",
+        estimated_days=2,
+    )
+    db.add(withdrawal)
+    db.add(
+        WalletTransactionModel(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            type="withdrawal",
+            amount=payload.amount,
+            fee=fee,
+            net=net,
+            desc="Demande de retrait",
+            status="pending",
+        )
+    )
+    await db.commit()
+    return WithdrawResponse(request_id=withdrawal.id, status=withdrawal.status, estimated_days=withdrawal.estimated_days)
+
+
+@app.get(
+    "/api/v1/marketplace/my-listings",
+    response_model=List[PublicListingItem],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_my_marketplace_listings(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    result = await db.execute(
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(ScanModel.user_id == user.id)
+        .order_by(ListingModel.created_at.desc())
+    )
+    return [_public_listing_item(listing, scan, seller, subscription.tier) for listing, scan, seller in result.all()]
+
+
+@app.post(
+    "/api/v1/marketplace/search",
+    response_model=List[PublicListingItem],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def search_marketplace(
+    payload: MarketplaceSearchInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    _viewer_user, viewer_subscription = await _optional_auth_context(authorization, db)
+    viewer_role = viewer_subscription.tier if viewer_subscription else "guest"
+    query = (
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(ListingModel.status.in_(list(MARKETPLACE_VISIBLE_STATUSES)))
+    )
+    if payload.query:
+        like_value = f"%{payload.query.strip()}%"
+        query = query.where(
+            or_(
+                ListingModel.title.ilike(like_value),
+                ListingModel.description.ilike(like_value),
+                ScanModel.dominant_class.ilike(like_value),
+            )
+        )
+    if payload.region:
+        query = query.where(ListingModel.region.ilike(f"%{payload.region.strip()}%"))
+    if payload.classification:
+        query = query.where(ScanModel.dominant_class.ilike(f"%{payload.classification.strip()}%"))
+    if payload.price_min is not None:
+        query = query.where(ListingModel.price >= payload.price_min)
+    if payload.price_max is not None:
+        query = query.where(ListingModel.price <= payload.price_max)
+
+    result = await db.execute(query.order_by(ListingModel.created_at.desc()))
+    return [
+        _public_listing_item(listing, scan, seller, viewer_role)
+        for listing, scan, seller in result.all()
+        if _effective_listing_status(listing) in MARKETPLACE_VISIBLE_STATUSES
+    ]
+
+
+@app.get(
+    "/api/v1/marketplace/stats",
+    response_model=MarketplaceStatsResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def get_marketplace_stats(
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    result = await db.execute(
+        select(ListingModel, ScanModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .where(ListingModel.status.in_(list(MARKETPLACE_VISIBLE_STATUSES | {"rejected"})))
+    )
+    rows = result.all()
+    total_listings = len(rows)
+    sold_rows = [(listing, scan) for listing, scan in rows if _legacy_listing_status(listing.status) == "sold"]
+    priced_rows = [(listing, scan) for listing, scan in rows if listing.price > 0]
+    avg_price = round(sum(listing.price for listing, _scan in priced_rows) / len(priced_rows), 2) if priced_rows else 0.0
+
+    by_class: dict[str, list[float]] = {}
+    by_region: dict[str, int] = {}
+    for listing, scan in rows:
+        by_class.setdefault(scan.dominant_class, []).append(listing.price)
+        region = listing.region or "unknown"
+        by_region[region] = by_region.get(region, 0) + 1
+
+    trending = [
+        {
+            "classification": class_name,
+            "change_percent": 0.0,
+            "avg_price": round(sum(prices) / len(prices), 2) if prices else 0.0,
+        }
+        for class_name, prices in sorted(by_class.items(), key=lambda item: len(item[1]), reverse=True)[:5]
+    ]
+    volume_by_region = [
+        {
+            "region": region,
+            "count": count,
+            "pct": round(count / total_listings, 4) if total_listings else 0.0,
+        }
+        for region, count in sorted(by_region.items(), key=lambda item: item[1], reverse=True)[:8]
+    ]
+    price_history = {
+        class_name: [round(sum(prices) / len(prices), 2) if prices else 0.0 for _month in range(12)]
+        for class_name, prices in by_class.items()
+    }
+    return MarketplaceStatsResponse(
+        total_listings=total_listings,
+        total_sales=len(sold_rows),
+        avg_price_dh=avg_price,
+        trending=trending,
+        volume_by_region=volume_by_region,
+        price_history=price_history,
+        months=["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+    )
 
 
 @app.post(

@@ -14,7 +14,7 @@ os.environ.setdefault("STORAGE_DIR", os.getenv("TEST_STORAGE_DIR", ".runtime/tes
 
 from business_logic import BusinessOrchestrator
 from billing import PREMIUM_DAILY_SCAN_LIMIT
-from database import AsyncSessionLocal, ListingModel, ScanModel, UserModel, UserSubscription
+from database import AsyncSessionLocal, CollectionItemModel, ListingModel, ScanModel, UserModel, UserSubscription
 from main import app
 
 API_KEY = os.environ["API_KEY"]
@@ -112,6 +112,14 @@ async def seed_rare_listing(user_id: str) -> tuple[str, str]:
                 region="Tissint",
             )
         )
+        db.add(
+            CollectionItemModel(
+                id=f"collection-{unique_suffix()}",
+                user_id=user_id,
+                scan_id=scan_id,
+                status="marketplace_listed",
+            )
+        )
         await db.commit()
     return scan_id, listing_id
 
@@ -197,7 +205,9 @@ def test_auth_refresh_logout_and_billing_source_of_truth(client: TestClient):
 
     me_response = client.get("/api/v1/auth/me", headers=api_headers(access_token))
     assert me_response.status_code == 200, me_response.text
-    assert me_response.json()["user"]["role"] == "free"
+    me_payload = me_response.json()
+    assert me_payload["user"]["role"] == "free"
+    assert me_payload["quota"]["role"] == "free"
 
     refresh_response = client.post(
         "/api/v1/auth/refresh",
@@ -206,6 +216,8 @@ def test_auth_refresh_logout_and_billing_source_of_truth(client: TestClient):
     )
     assert refresh_response.status_code == 200, refresh_response.text
     refreshed = refresh_response.json()
+    assert refreshed["access_token"]
+    assert refreshed["refresh_token"]
 
     old_refresh_response = client.post(
         "/api/v1/auth/refresh",
@@ -387,8 +399,13 @@ def test_admin_radar_requires_admin_and_writes_audit_log(client: TestClient):
     admin_headers = api_headers(admin_session["access_token"])
     radar_response = client.get("/api/v1/admin/radar", headers=admin_headers)
     assert radar_response.status_code == 200, radar_response.text
-    radar_ids = {item["listing_id"] for item in radar_response.json()}
+    radar_items = radar_response.json()
+    radar_ids = {item["listing_id"] for item in radar_items}
     assert listing_id in radar_ids
+    radar_item = next(item for item in radar_items if item["listing_id"] == listing_id)
+    assert radar_item["main_image_uri"].startswith("/storage/")
+    assert radar_item["image_url"] == radar_item["main_image_uri"]
+    assert radar_item["thumbnail_uri"] == radar_item["main_image_uri"]
 
     reserve_response = client.post(
         f"/api/v1/admin/radar/{listing_id}/reserve",
@@ -396,6 +413,7 @@ def test_admin_radar_requires_admin_and_writes_audit_log(client: TestClient):
         json={"reason": "CI reserve"},
     )
     assert reserve_response.status_code == 200, reserve_response.text
+    assert reserve_response.json()["ok"] is True
     assert reserve_response.json()["status"] == "admin_reserved"
 
     audit_response = client.get(
@@ -405,3 +423,162 @@ def test_admin_radar_requires_admin_and_writes_audit_log(client: TestClient):
     assert audit_response.status_code == 200, audit_response.text
     audit_actions = {entry["action"] for entry in audit_response.json()}
     assert "admin_reserve_listing" in audit_actions
+
+
+def test_ui_alignment_collection_and_marketplace_images(client: TestClient):
+    seller_session = register_user(client, "ui-seller")
+    seller_id = seller_session["user"]["id"]
+    scan_id, listing_id = run_in_app_loop(client, seed_rare_listing, seller_id)
+
+    listings_response = client.get("/api/v1/marketplace/listings", headers=api_headers())
+    assert listings_response.status_code == 200, listings_response.text
+    listing = next(item for item in listings_response.json() if item["listing_id"] == listing_id)
+    assert listing["main_image_uri"].startswith("/storage/")
+    assert listing["image_url"] == listing["main_image_uri"]
+    assert listing["thumbnail_uri"] == listing["main_image_uri"]
+    assert listing["can_contact"] is False
+    assert listing["seller_phone"] is None
+    assert listing["seller_whatsapp"] is None
+
+    detail_response = client.get(f"/api/v1/marketplace/listings/{listing_id}", headers=api_headers())
+    assert detail_response.status_code == 200, detail_response.text
+    detail = detail_response.json()
+    assert detail["listing_id"] == listing_id
+    assert detail["image_url"] == listing["image_url"]
+
+    collection_response = client.get(
+        "/api/v1/collection",
+        headers={**api_headers(), "X-User-Id": seller_id},
+    )
+    assert collection_response.status_code == 200, collection_response.text
+    collection_item = next(item for item in collection_response.json() if item["scan_id"] == scan_id)
+    assert collection_item["main_image_uri"].startswith("/storage/")
+    assert collection_item["image_url"] == collection_item["main_image_uri"]
+    assert collection_item["thumbnail_uri"] == collection_item["main_image_uri"]
+    assert collection_item["weight_g"] == 18.4
+    assert collection_item["region"] == "Tissint"
+    assert collection_item["notes"] == "Admin radar candidate without public contact data."
+
+
+def test_ui_messages_favorites_notifications_ratings_wallet_and_marketplace_extensions(client: TestClient):
+    seller_session = register_user(client, "social-seller")
+    buyer_session = register_user(client, "social-buyer")
+    seller_id = seller_session["user"]["id"]
+    scan_id, listing_id = run_in_app_loop(client, seed_rare_listing, seller_id)
+    seller_headers = api_headers(seller_session["access_token"])
+    buyer_headers = api_headers(buyer_session["access_token"])
+
+    add_favorite = client.post(f"/api/v1/favorites/{listing_id}", headers=buyer_headers)
+    assert add_favorite.status_code == 200, add_favorite.text
+    assert add_favorite.json()["ok"] is True
+    duplicate_favorite = client.post(f"/api/v1/favorites/{listing_id}", headers=buyer_headers)
+    assert duplicate_favorite.status_code == 200, duplicate_favorite.text
+
+    favorites = client.get("/api/v1/favorites", headers=buyer_headers)
+    assert favorites.status_code == 200, favorites.text
+    favorite_listing = next(item for item in favorites.json() if item["listing_id"] == listing_id)
+    assert favorite_listing["image_url"].startswith("/storage/")
+
+    first_message = client.post(
+        "/api/v1/messages",
+        headers=buyer_headers,
+        json={"listing_id": listing_id, "text": "Bonjour, je suis interesse."},
+    )
+    assert first_message.status_code == 201, first_message.text
+    first_message_payload = first_message.json()
+    assert first_message_payload["from_me"] is True
+    thread_id = first_message_payload["thread_id"]
+
+    seller_inbox = client.get("/api/v1/messages", headers=seller_headers)
+    assert seller_inbox.status_code == 200, seller_inbox.text
+    seller_thread = next(thread for thread in seller_inbox.json() if thread["id"] == thread_id)
+    assert seller_thread["unread"] == 1
+    assert seller_thread["listing_image_uri"].startswith("/storage/")
+
+    seller_notifications = client.get("/api/v1/notifications", headers=seller_headers)
+    assert seller_notifications.status_code == 200, seller_notifications.text
+    notification = next(item for item in seller_notifications.json() if item["type"] == "message")
+    assert notification["read"] is False
+
+    read_notification = client.patch(f"/api/v1/notifications/{notification['id']}/read", headers=seller_headers)
+    assert read_notification.status_code == 200, read_notification.text
+    assert read_notification.json()["ok"] is True
+    read_all = client.post("/api/v1/notifications/read-all", headers=seller_headers)
+    assert read_all.status_code == 200, read_all.text
+
+    seller_thread_messages = client.get(f"/api/v1/messages/{thread_id}", headers=seller_headers)
+    assert seller_thread_messages.status_code == 200, seller_thread_messages.text
+    assert seller_thread_messages.json()[0]["from_me"] is False
+
+    seller_reply = client.post(
+        "/api/v1/messages",
+        headers=seller_headers,
+        json={"thread_id": thread_id, "text": "Merci, je vous reponds ici."},
+    )
+    assert seller_reply.status_code == 201, seller_reply.text
+    assert seller_reply.json()["from_me"] is True
+
+    buyer_inbox = client.get("/api/v1/messages", headers=buyer_headers)
+    assert buyer_inbox.status_code == 200, buyer_inbox.text
+    buyer_thread = next(thread for thread in buyer_inbox.json() if thread["id"] == thread_id)
+    assert buyer_thread["unread"] == 1
+
+    push_response = client.post(
+        "/api/v1/notifications/push-subscribe",
+        headers=buyer_headers,
+        json={
+            "endpoint": f"https://push.example.test/{unique_suffix()}",
+            "keys": {"p256dh": "p256dh-test-key", "auth": "auth-test-key"},
+        },
+    )
+    assert push_response.status_code == 200, push_response.text
+    assert push_response.json()["subscribed"] is True
+
+    rating_response = client.post(
+        "/api/v1/ratings",
+        headers=buyer_headers,
+        json={"listing_id": listing_id, "seller_id": seller_id, "stars": 5, "comment": "Tres serieux."},
+    )
+    assert rating_response.status_code == 201, rating_response.text
+    assert rating_response.json()["ok"] is True
+
+    seller_profile = client.get(f"/api/v1/sellers/{seller_id}", headers=buyer_headers)
+    assert seller_profile.status_code == 200, seller_profile.text
+    seller_profile_payload = seller_profile.json()
+    assert seller_profile_payload["average_rating"] == 5.0
+    assert seller_profile_payload["total_ratings"] == 1
+    assert any(item["listing_id"] == listing_id for item in seller_profile_payload["listings"])
+
+    wallet_response = client.get("/api/v1/wallet", headers=buyer_headers)
+    assert wallet_response.status_code == 200, wallet_response.text
+    assert wallet_response.json()["balance"] == 0.0
+    withdrawal_response = client.post(
+        "/api/v1/wallet/withdraw",
+        headers=buyer_headers,
+        json={"amount": 100.0, "iban": "MA64011519000001205000534921"},
+    )
+    assert withdrawal_response.status_code == 409
+    assert error_code(withdrawal_response) == "INSUFFICIENT_FUNDS"
+
+    my_listings = client.get("/api/v1/marketplace/my-listings", headers=seller_headers)
+    assert my_listings.status_code == 200, my_listings.text
+    assert any(item["scan_id"] == scan_id for item in my_listings.json())
+
+    search_response = client.post(
+        "/api/v1/marketplace/search",
+        headers=api_headers(),
+        json={"query": "Martian", "region": "Tissint", "classification": "Martian"},
+    )
+    assert search_response.status_code == 200, search_response.text
+    assert any(item["listing_id"] == listing_id for item in search_response.json())
+
+    stats_response = client.get("/api/v1/marketplace/stats", headers=api_headers())
+    assert stats_response.status_code == 200, stats_response.text
+    stats = stats_response.json()
+    assert stats["total_listings"] >= 1
+    assert stats["avg_price_dh"] > 0
+
+    delete_favorite = client.delete(f"/api/v1/favorites/{listing_id}", headers=buyer_headers)
+    assert delete_favorite.status_code == 200, delete_favorite.text
+    delete_favorite_again = client.delete(f"/api/v1/favorites/{listing_id}", headers=buyer_headers)
+    assert delete_favorite_again.status_code == 200, delete_favorite_again.text

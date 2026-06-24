@@ -106,6 +106,95 @@ class MessageModel(Base):
     text_content = Column(String, nullable=False)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
+class MessageThreadModel(Base):
+    __tablename__ = "message_threads"
+    __table_args__ = (UniqueConstraint("listing_id", "buyer_id", "seller_id", name="uq_message_thread_participants"),)
+
+    id = Column(String, primary_key=True, index=True)
+    listing_id = Column(String, ForeignKey("listings.id"), index=True, nullable=False)
+    buyer_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    seller_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    unread_for_buyer = Column(Integer, nullable=False, default=0)
+    unread_for_seller = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class FavoriteModel(Base):
+    __tablename__ = "favorites"
+    __table_args__ = (UniqueConstraint("user_id", "listing_id", name="uq_favorite_user_listing"),)
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    listing_id = Column(String, ForeignKey("listings.id"), index=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class NotificationModel(Base):
+    __tablename__ = "notifications"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    type = Column(String, index=True, nullable=False)
+    title = Column(String, nullable=False)
+    body = Column(String, nullable=False)
+    read = Column(Boolean, nullable=False, default=False)
+    action = Column(String, nullable=True)
+    event_metadata = Column("metadata", JSONB, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class PushSubscriptionModel(Base):
+    __tablename__ = "push_subscriptions"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    endpoint = Column(String, unique=True, index=True, nullable=False)
+    keys = Column(JSONB, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class SellerRatingModel(Base):
+    __tablename__ = "seller_ratings"
+    __table_args__ = (UniqueConstraint("listing_id", "buyer_id", name="uq_seller_rating_listing_buyer"),)
+
+    id = Column(String, primary_key=True, index=True)
+    listing_id = Column(String, ForeignKey("listings.id"), index=True, nullable=False)
+    seller_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    buyer_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    stars = Column(Integer, nullable=False)
+    comment = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class WalletAccountModel(Base):
+    __tablename__ = "wallet_accounts"
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True, index=True)
+    balance = Column(Float, nullable=False, default=0.0)
+    currency = Column(String, nullable=False, default="MAD")
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class WalletTransactionModel(Base):
+    __tablename__ = "wallet_transactions"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    type = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    fee = Column(Float, nullable=False, default=0.0)
+    net = Column(Float, nullable=False)
+    desc = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class WithdrawalRequestModel(Base):
+    __tablename__ = "withdrawal_requests"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    amount = Column(Float, nullable=False)
+    iban = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="processing")
+    estimated_days = Column(Integer, nullable=False, default=2)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
 class AuditLogModel(Base):
     __tablename__ = "audit_logs"
 

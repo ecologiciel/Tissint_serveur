@@ -7,15 +7,31 @@ import type {
   BillingCheckoutInput,
   BillingWebhookResponse,
   CheckoutSessionResponse,
+  CollectionItemResponse,
   CreateMessageInput,
   HealthResponse,
   InvoiceResponse,
   MarketplaceListingResponse,
+  MarketplaceSearchInput,
+  MarketplaceStatsResponse,
   MessageResponse,
+  MessageThreadResponse,
+  NotificationResponse,
+  OkResponse,
   PublicListingItem,
   PublishListingInput,
+  PushSubscribeInput,
+  PushSubscribeResponse,
+  RatingInput,
+  RatingResponse,
   ScanDecisionResponse,
+  SellerProfileResponse,
+  SendMessageInput,
   SubscriptionResponse,
+  UiMessageResponse,
+  WalletResponse,
+  WithdrawInput,
+  WithdrawResponse,
 } from './generated/types';
 
 export type TinssitUploadFile =
@@ -137,6 +153,109 @@ export function createTinssitClient(config: TinssitClientConfig) {
 
     getMarketplaceListings: () =>
       requestJson<PublicListingItem[]>('/api/v1/marketplace/listings'),
+
+    getMarketplaceListing: (listingId: string) =>
+      requestJson<PublicListingItem>(
+        `/api/v1/marketplace/listings/${encodeURIComponent(listingId)}`,
+      ),
+
+    getMyMarketplaceListings: () =>
+      requestJson<PublicListingItem[]>('/api/v1/marketplace/my-listings'),
+
+    searchMarketplace: (payload: MarketplaceSearchInput) =>
+      requestJson<PublicListingItem[]>('/api/v1/marketplace/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+
+    getMarketplaceStats: () =>
+      requestJson<MarketplaceStatsResponse>('/api/v1/marketplace/stats'),
+
+    listCollection: (userId: string) =>
+      requestJson<CollectionItemResponse[]>('/api/v1/collection', {
+        headers: { 'X-User-Id': userId },
+      }),
+
+    addScanToCollection: (scanId: string, userId: string) =>
+      requestJson<CollectionItemResponse>(
+        `/api/v1/collection/${encodeURIComponent(scanId)}`,
+        {
+          method: 'POST',
+          headers: { 'X-User-Id': userId },
+        },
+      ),
+
+    getCollectionItem: (scanId: string, userId: string) =>
+      requestJson<CollectionItemResponse>(
+        `/api/v1/collection/${encodeURIComponent(scanId)}`,
+        {
+          headers: { 'X-User-Id': userId },
+        },
+      ),
+
+    sendMessage: (payload: SendMessageInput) =>
+      requestJson<UiMessageResponse>('/api/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+
+    listMessages: () => requestJson<MessageThreadResponse[]>('/api/v1/messages'),
+
+    getMessageThread: (threadId: string) =>
+      requestJson<UiMessageResponse[]>(`/api/v1/messages/${encodeURIComponent(threadId)}`),
+
+    listFavorites: () => requestJson<PublicListingItem[]>('/api/v1/favorites'),
+
+    addFavorite: (listingId: string) =>
+      requestJson<OkResponse>(`/api/v1/favorites/${encodeURIComponent(listingId)}`, {
+        method: 'POST',
+      }),
+
+    deleteFavorite: (listingId: string) =>
+      requestJson<OkResponse>(`/api/v1/favorites/${encodeURIComponent(listingId)}`, {
+        method: 'DELETE',
+      }),
+
+    listNotifications: () => requestJson<NotificationResponse[]>('/api/v1/notifications'),
+
+    markNotificationRead: (notificationId: string) =>
+      requestJson<OkResponse>(
+        `/api/v1/notifications/${encodeURIComponent(notificationId)}/read`,
+        { method: 'PATCH' },
+      ),
+
+    markAllNotificationsRead: () =>
+      requestJson<OkResponse>('/api/v1/notifications/read-all', { method: 'POST' }),
+
+    pushSubscribe: (payload: PushSubscribeInput) =>
+      requestJson<PushSubscribeResponse>('/api/v1/notifications/push-subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+
+    rateSeller: (payload: RatingInput) =>
+      requestJson<RatingResponse>('/api/v1/ratings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+
+    getSeller: (sellerIdOrName: string) =>
+      requestJson<SellerProfileResponse>(
+        `/api/v1/sellers/${encodeURIComponent(sellerIdOrName)}`,
+      ),
+
+    getWallet: () => requestJson<WalletResponse>('/api/v1/wallet'),
+
+    withdrawWallet: (payload: WithdrawInput) =>
+      requestJson<WithdrawResponse>('/api/v1/wallet/withdraw', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
 
     listAdminRadar: () => requestJson<AdminRadarListingResponse[]>('/api/v1/admin/radar'),
 
