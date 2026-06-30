@@ -12,9 +12,11 @@ os.environ.setdefault(
 )
 os.environ.setdefault("STORAGE_DIR", os.getenv("TEST_STORAGE_DIR", ".runtime/test-storage"))
 
-from business_logic import BusinessOrchestrator
+from business_logic import BusinessOrchestrator, HESITANT_THRESHOLD, SUCCESS_THRESHOLD
 from billing import PREMIUM_DAILY_SCAN_LIMIT
 from database import AsyncSessionLocal, CollectionItemModel, ListingModel, ScanModel, UserModel, UserSubscription
+from fusion_engine import MeteoriteFusionEngine
+import main as main_module
 from main import app
 
 API_KEY = os.environ["API_KEY"]
@@ -149,13 +151,61 @@ async def seed_scan_for_idempotent_message(user_id: str, client_uuid: str) -> st
     return scan_id
 
 
+async def seed_scan_for_interior_update(user_id: str) -> str:
+    scan_id = f"scan-{unique_suffix()}"
+    async with AsyncSessionLocal() as db:
+        db.add(
+            ScanModel(
+                id=scan_id,
+                client_uuid=f"interior-{unique_suffix()}",
+                user_id=user_id,
+                status_code="DIAGNOSTIC_SUCCESS_HIGH",
+                is_meteorite=True,
+                meteorite_probability=0.86,
+                dominant_class="Chondrite",
+                class_confidence=0.43,
+                weight=52.0,
+                magnetic=None,
+                latitude=None,
+                longitude=None,
+                raw_vision_outputs={
+                    "exterior": {
+                        "dino": {
+                            "prob_bin": 0.95,
+                            "prob_sub": [0.02, 0.10, 0.01, 0.45, 0.02, 0.40],
+                        },
+                        "swin": {
+                            "prob_bin": 0.90,
+                            "prob_sub": [0.04, 0.20, 0.01, 0.43, 0.02, 0.30],
+                        },
+                        "convnext": {
+                            "prob_bin": 0.73,
+                            "prob_sub": [0.12, 0.10, 0.01, 0.41, 0.10, 0.26],
+                        },
+                    },
+                    "interior": None,
+                },
+                exterior_images_paths=["storage/test/interior-before.jpg"],
+            )
+        )
+        await db.commit()
+    return scan_id
+
+
+async def load_scan_raw_vision(scan_id: str) -> dict:
+    async with AsyncSessionLocal() as db:
+        scan = await db.get(ScanModel, scan_id)
+        assert scan is not None
+        return scan.raw_vision_outputs
+
+
 def test_scan_diagnostic_messages_are_deterministic():
     orchestrator = BusinessOrchestrator()
 
     success = orchestrator.evaluate_decision(
         {
             "is_meteorite": True,
-            "meteorite_probability": 0.8263893872499467,
+            "meteorite_probability": SUCCESS_THRESHOLD,
             "dominant_class": "Chondrite",
             "class_confidence": 0.7738270749648412,
             "metadata_applied": {},
@@ -163,24 +213,60 @@ def test_scan_diagnostic_messages_are_deterministic():
         language="fr-FR",
     )
     assert success["status_code"] == "DIAGNOSTIC_SUCCESS_HIGH"
+    assert success["is_meteorite"] is True
+    assert success["actions"]["invite_interior_cut"] is True
     assert success["message"]["language"] == "fr"
     assert success["message"]["tone"] == "success"
-    assert "82.6%" in success["message"]["body"]
+    assert "80.8%" in success["message"]["body"]
     assert "marketplace" in success["message"]["body"]
 
     hesitant = orchestrator.evaluate_decision(
         {
             "is_meteorite": True,
-            "meteorite_probability": 0.72,
+            "meteorite_probability": HESITANT_THRESHOLD,
             "dominant_class": "Meteore_Unknown",
             "class_confidence": 0.61,
             "metadata_applied": {},
         }
     )
     assert hesitant["status_code"] == "DIAGNOSTIC_HESITANT"
+    assert hesitant["is_meteorite"] is True
+    assert hesitant["actions"]["invite_interior_cut"] is True
     assert hesitant["message"]["language"] == "ar"
     assert hesitant["message"]["tone"] == "warning"
-    assert "72.0%" in hesitant["message"]["body"]
+    assert "70.0%" in hesitant["message"]["body"]
+    assert "Meteore_Unknown" not in hesitant["message"]["body"]
+
+    rejected_by_threshold = orchestrator.evaluate_decision(
+        {
+            "is_meteorite": True,
+            "meteorite_probability": HESITANT_THRESHOLD - 0.01,
+            "dominant_class": "Chondrite",
+            "class_confidence": 0.61,
+            "metadata_applied": {},
+        },
+        language="fr-FR",
+    )
+    assert rejected_by_threshold["status_code"] == "DIAGNOSTIC_REJECTED"
+    assert rejected_by_threshold["is_meteorite"] is False
+    assert rejected_by_threshold["actions"]["invite_interior_cut"] is False
+
+    success_with_cut = orchestrator.evaluate_decision(
+        {
+            "is_meteorite": True,
+            "meteorite_probability": 0.91,
+            "dominant_class": "Meteore_Unknown",
+            "class_confidence": 0.88,
+            "metadata_applied": {},
+        },
+        language="fr-FR",
+        has_interior_cut=True,
+    )
+    assert success_with_cut["status_code"] == "DIAGNOSTIC_SUCCESS_HIGH"
+    assert success_with_cut["actions"]["invite_interior_cut"] is False
+    assert "Meteore_Unknown" not in success_with_cut["message"]["body"]
+    assert "prise en compte" in success_with_cut["message"]["body"]
+    assert "renforcera" not in success_with_cut["message"]["body"]
 
     rejected = orchestrator.evaluate_decision(
         {
@@ -196,6 +282,24 @@ def test_scan_diagnostic_messages_are_deterministic():
     assert rejected["message"]["language"] == "ar"
     assert rejected["message"]["tone"] == "neutral"
     assert "12.3%" in rejected["message"]["body"]
+
+
+def test_fusion_engine_uses_hesitant_threshold_for_binary_verdict():
+    engine = MeteoriteFusionEngine()
+    model_output = {"prob_bin": HESITANT_THRESHOLD - 0.01, "prob_sub": [0.02, 0.03, 0.02, 0.86, 0.03, 0.04]}
+
+    output = engine.fuse_outputs(
+        {
+            "exterior": {
+                "dino": model_output,
+                "swin": model_output,
+                "convnext": model_output,
+            }
+        }
+    )
+
+    assert output["meteorite_probability"] == pytest.approx(HESITANT_THRESHOLD - 0.01)
+    assert output["is_meteorite"] is False
 
 
 def test_auth_refresh_logout_and_billing_source_of_truth(client: TestClient):
@@ -379,6 +483,103 @@ def test_scan_idempotent_response_includes_localized_message(client: TestClient)
     assert payload["message"]["tone"] == "success"
     assert "82.6%" in payload["message"]["body"]
     assert "marketplace" in payload["message"]["body"]
+
+
+def test_scan_exterior_with_initial_interior_cut_suppresses_cut_invite(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeVisionPipeline:
+        def process_full_scan(self, list_exterior_bytes: list[bytes], interior_bytes: bytes | None = None) -> dict:
+            assert len(list_exterior_bytes) == 3
+            assert interior_bytes == b"cut-photo"
+            sub_vector = [0.02, 0.03, 0.02, 0.86, 0.03, 0.04]
+            model_output = {"prob_bin": 0.72, "prob_sub": sub_vector}
+            return {
+                "exterior": {
+                    "dino": model_output,
+                    "swin": model_output,
+                    "convnext": model_output,
+                },
+                "interior": {
+                    "dino": model_output,
+                    "swin": model_output,
+                    "convnext": model_output,
+                },
+            }
+
+    monkeypatch.setattr(main_module, "vision_pipeline", FakeVisionPipeline())
+    session = register_user(client, "initial-cut")
+    user_id = session["user"]["id"]
+
+    response = client.post(
+        "/api/v1/scan/exterior",
+        headers={**api_headers(), "Accept-Language": "fr-FR"},
+        data={"client_uuid": f"initial-cut-{unique_suffix()}", "user_id": user_id},
+        files=[
+            ("files_exterior", ("one.jpg", b"jpeg-one", "image/jpeg")),
+            ("files_exterior", ("two.jpg", b"jpeg-two", "image/jpeg")),
+            ("files_exterior", ("three.jpg", b"jpeg-three", "image/jpeg")),
+            ("file_interior", ("cut.jpg", b"cut-photo", "image/jpeg")),
+        ],
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status_code"] == "DIAGNOSTIC_HESITANT"
+    assert payload["actions"]["invite_interior_cut"] is False
+    assert "prise en compte" in payload["message"]["body"]
+    assert "indispensable" not in payload["message"]["body"]
+
+    collection_response = client.post(
+        f"/api/v1/collection/{payload['scan_id']}",
+        headers={**api_headers(), "X-User-Id": user_id},
+    )
+    assert collection_response.status_code == 201, collection_response.text
+    assert collection_response.json()["status"] == "pending_validation"
+
+
+def test_scan_interior_update_persists_raw_vision_outputs(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    class FakeVisionPipeline:
+        def predict_image_parallel(self, _image_bytes: bytes) -> dict:
+            return {
+                "dino": {
+                    "prob_bin": 0.99,
+                    "prob_sub": [0.01, 0.03, 0.01, 0.05, 0.01, 0.89],
+                },
+                "swin": {
+                    "prob_bin": 0.98,
+                    "prob_sub": [0.01, 0.04, 0.01, 0.05, 0.01, 0.88],
+                },
+                "convnext": {
+                    "prob_bin": 0.97,
+                    "prob_sub": [0.01, 0.05, 0.01, 0.06, 0.01, 0.86],
+                },
+            }
+
+    monkeypatch.setattr(main_module, "vision_pipeline", FakeVisionPipeline())
+    session = register_user(client, "interior")
+    scan_id = run_in_app_loop(client, seed_scan_for_interior_update, session["user"]["id"])
+
+    response = client.patch(
+        f"/api/v1/scan/{scan_id}/interior",
+        headers={**api_headers(), "Accept-Language": "fr-FR"},
+        files={"file_interior": ("interior.jpg", b"not-a-real-image-but-valid-for-fake-pipeline", "image/jpeg")},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["scan_id"] == scan_id
+    assert payload["dominant_class"] == "Meteore_Unknown"
+    assert payload["actions"]["invite_interior_cut"] is False
+    assert "Meteore_Unknown" not in payload["message"]["body"]
+    assert "prise en compte" in payload["message"]["body"]
+    assert "renforcera" not in payload["message"]["body"]
+
+    raw_vision_outputs = run_in_app_loop(client, load_scan_raw_vision, scan_id)
+    assert raw_vision_outputs["interior"] is not None
+    assert raw_vision_outputs["interior"]["dino"]["prob_bin"] == 0.99
+    assert raw_vision_outputs["interior"]["convnext"]["prob_sub"][5] == 0.86
 
 
 def test_admin_radar_requires_admin_and_writes_audit_log(client: TestClient):

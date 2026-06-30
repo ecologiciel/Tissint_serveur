@@ -1,6 +1,9 @@
 import numpy as np
 from typing import List, Optional, Dict, Any
 
+METEORITE_THRESHOLD = 0.70
+
+
 class MeteoriteFusionEngine:
     def __init__(self):
         self.classes = ['None', 'Achondrite', 'Carbonee', 'Chondrite', 'Metallique', 'Meteore_Unknown']
@@ -60,7 +63,7 @@ class MeteoriteFusionEngine:
                 class_confidence = min(class_confidence * 1.05, 1.0)
 
         # 4. Formatage du verdict final
-        is_meteorite = final_bin_prob >= 0.5
+        is_meteorite = final_bin_prob >= METEORITE_THRESHOLD
         
         # Sécurité : Si le filtre binaire dit "Oui" mais qu'aucune sous-classe n'est solide, on bascule sur Unknown
         if is_meteorite and predicted_class_name == "None":

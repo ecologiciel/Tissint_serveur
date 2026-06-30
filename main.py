@@ -989,6 +989,8 @@ def _collection_status_for_scan(scan: ScanModel, listing: Optional[ListingModel]
     if scan.status_code == "DIAGNOSTIC_SUCCESS_HIGH":
         return "eligible"
     if scan.status_code == "DIAGNOSTIC_HESITANT":
+        if scan.interior_image_path:
+            return "pending_validation"
         return "needs_cut"
     return "pending_validation"
 
@@ -1062,7 +1064,11 @@ async def scan_exterior(
     
     if existing_scan:
         print(f"🔄 [Idempotence] Scan existant récupéré pour client_uuid: {metadata.client_uuid}")
-        actions = business_orchestrator.build_scan_actions(existing_scan.status_code)
+        has_interior_cut = bool(existing_scan.interior_image_path)
+        actions = business_orchestrator.build_scan_actions(
+            existing_scan.status_code,
+            has_interior_cut=has_interior_cut,
+        )
         return {
             "status_code": existing_scan.status_code,
             "is_meteorite": existing_scan.is_meteorite,
@@ -1082,6 +1088,7 @@ async def scan_exterior(
                 meteorite_probability=existing_scan.meteorite_probability,
                 actions=actions,
                 language=accept_language,
+                has_interior_cut=has_interior_cut,
             ),
             "scan_id": existing_scan.id,
             "is_sync_retry": True
@@ -1138,7 +1145,11 @@ async def scan_exterior(
         )
         
         # 4. Orchestrateur Métier (Décision)
-        final_decision = business_orchestrator.evaluate_decision(fusion_results, language=accept_language)
+        final_decision = business_orchestrator.evaluate_decision(
+            fusion_results,
+            language=accept_language,
+            has_interior_cut=bool(interior_path),
+        )
 
     except Exception as e:
         raise AppProductionException("INTERNAL_PROCESSING_ERROR", f"Erreur de traitement IA: {str(e)}", 500)
@@ -1236,7 +1247,7 @@ async def scan_interior_update(
 
     try:
         # 3. Inférence vision sur la coupe intérieure
-        vision_results = scan.raw_vision_outputs
+        vision_results = dict(scan.raw_vision_outputs or {})
         
         # Inférence asynchrone d'une seule image via le pipeline (Thread offloading)
         new_interior_vision = await anyio.to_thread.run_sync(
@@ -1255,7 +1266,11 @@ async def scan_interior_update(
         magnetic=scan.magnetic
     )
 
-    final_decision = business_orchestrator.evaluate_decision(fusion_results, language=accept_language)
+    final_decision = business_orchestrator.evaluate_decision(
+        fusion_results,
+        language=accept_language,
+        has_interior_cut=True,
+    )
 
     # 5. Mise à jour du document en BDD
     # On force manuellement le json pour la mise a jour
