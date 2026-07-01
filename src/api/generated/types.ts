@@ -18,13 +18,16 @@ export type AdminRadarListingResponse = {
   "status": string;
   "dominant_class": string;
   "confidence": number;
+  "class_confidence": number;
   "meteorite_probability": number;
+  "fusion_score": number;
   "price": number;
   "price_mode"?: string;
   "title"?: string | null;
   "description"?: string | null;
   "region"?: string | null;
   "weight"?: number | null;
+  "weight_g"?: number | null;
   "magnetic"?: boolean | null;
   "latitude"?: number | null;
   "longitude"?: number | null;
@@ -39,6 +42,8 @@ export type AdminRadarListingResponse = {
   "main_image_uri"?: string | null;
   "image_url"?: string | null;
   "thumbnail_uri"?: string | null;
+  "interior_image_uri"?: string | null;
+  "gallery_images"?: string[];
 };
 
 export type ApiError = {
@@ -95,13 +100,13 @@ export type BillingWebhookResponse = {
 
 export type Body_scan_exterior_api_v1_scan_exterior_post = {
   "client_uuid": string;
+  "user_id": string;
   "files_exterior": string[];
   "file_interior"?: string | null;
   "weight"?: number | null;
   "magnetic"?: boolean | null;
   "latitude"?: number | null;
   "longitude"?: number | null;
-  "user_id": string;
 };
 
 export type Body_scan_interior_update_api_v1_scan__scan_id__interior_patch = {
@@ -124,11 +129,19 @@ export type CollectionItemResponse = {
   "class_name": string;
   "fusion_score": number;
   "status": string;
+  "status_code"?: string | null;
+  "is_meteorite"?: boolean | null;
+  "class_confidence"?: number | null;
   "created_at": string;
   "main_image_uri"?: string | null;
   "image_url"?: string | null;
   "thumbnail_uri"?: string | null;
+  "interior_image_uri"?: string | null;
+  "gallery_images"?: string[];
   "weight_g"?: number | null;
+  "magnetic"?: boolean | null;
+  "latitude"?: number | null;
+  "longitude"?: number | null;
   "region"?: string | null;
   "notes"?: string | null;
   "meteorite_probability"?: number | null;
@@ -177,12 +190,16 @@ export type MarketplaceListingResponse = {
   "is_rare_candidate": boolean;
   "dominant_class": string;
   "confidence": number;
+  "class_confidence": number;
+  "meteorite_probability": number;
+  "fusion_score": number;
   "price": number;
   "price_mode"?: string;
   "title"?: string | null;
   "description"?: string | null;
   "region"?: string | null;
   "weight"?: number | null;
+  "weight_g"?: number | null;
   "magnetic"?: boolean | null;
   "blurred_latitude"?: number | null;
   "blurred_longitude"?: number | null;
@@ -190,6 +207,8 @@ export type MarketplaceListingResponse = {
   "main_image_uri"?: string | null;
   "image_url"?: string | null;
   "thumbnail_uri"?: string | null;
+  "interior_image_uri"?: string | null;
+  "gallery_images"?: string[];
 };
 
 export type MarketplaceRegionVolume = {
@@ -264,7 +283,11 @@ export type PublicListingItem = {
   "status": string;
   "dominant_class": string;
   "confidence": number;
+  "class_confidence": number;
+  "meteorite_probability": number;
+  "fusion_score": number;
   "weight": number | null;
+  "weight_g"?: number | null;
   "blurred_latitude": number | null;
   "blurred_longitude": number | null;
   "is_rare"?: boolean;
@@ -284,6 +307,8 @@ export type PublicListingItem = {
   "main_image_uri"?: string | null;
   "image_url"?: string | null;
   "thumbnail_uri"?: string | null;
+  "interior_image_uri"?: string | null;
+  "gallery_images"?: string[];
 };
 
 export type PublishListingInput = {
@@ -292,6 +317,7 @@ export type PublishListingInput = {
   "description"?: string | null;
   "price_mode"?: string;
   "region"?: string | null;
+  "weight_g"?: number | null;
 };
 
 export type PushSubscribeInput = {

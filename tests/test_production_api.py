@@ -192,11 +192,47 @@ async def seed_scan_for_interior_update(user_id: str) -> str:
     return scan_id
 
 
+async def seed_publishable_scan_without_weight(user_id: str) -> str:
+    scan_id = f"scan-{unique_suffix()}"
+    async with AsyncSessionLocal() as db:
+        db.add(
+            ScanModel(
+                id=scan_id,
+                client_uuid=f"publish-{unique_suffix()}",
+                user_id=user_id,
+                status_code="DIAGNOSTIC_SUCCESS_HIGH",
+                is_meteorite=True,
+                meteorite_probability=0.88,
+                dominant_class="Chondrite",
+                class_confidence=0.74,
+                weight=None,
+                magnetic=True,
+                latitude=31.6,
+                longitude=-7.9,
+                raw_vision_outputs={"exterior": {}, "interior": {}},
+                exterior_images_paths=[
+                    "storage/test/publish-exterior-a.jpg",
+                    "storage/test/publish-exterior-b.jpg",
+                ],
+                interior_image_path="storage/test/publish-interior.jpg",
+            )
+        )
+        await db.commit()
+    return scan_id
+
+
 async def load_scan_raw_vision(scan_id: str) -> dict:
     async with AsyncSessionLocal() as db:
         scan = await db.get(ScanModel, scan_id)
         assert scan is not None
         return scan.raw_vision_outputs
+
+
+async def load_scan_weight(scan_id: str) -> float | None:
+    async with AsyncSessionLocal() as db:
+        scan = await db.get(ScanModel, scan_id)
+        assert scan is not None
+        return scan.weight
 
 
 def test_scan_diagnostic_messages_are_deterministic():
@@ -563,7 +599,7 @@ def test_scan_interior_update_persists_raw_vision_outputs(client: TestClient, mo
 
     response = client.patch(
         f"/api/v1/scan/{scan_id}/interior",
-        headers={**api_headers(), "Accept-Language": "fr-FR"},
+        headers={**api_headers(session["access_token"]), "Accept-Language": "fr-FR"},
         files={"file_interior": ("interior.jpg", b"not-a-real-image-but-valid-for-fake-pipeline", "image/jpeg")},
     )
 
@@ -580,6 +616,160 @@ def test_scan_interior_update_persists_raw_vision_outputs(client: TestClient, mo
     assert raw_vision_outputs["interior"] is not None
     assert raw_vision_outputs["interior"]["dino"]["prob_bin"] == 0.99
     assert raw_vision_outputs["interior"]["convnext"]["prob_sub"][5] == 0.86
+
+
+def test_collection_identity_bearer_legacy_mismatch_and_delete(client: TestClient):
+    seller_session = register_user(client, "collection-owner")
+    buyer_session = register_user(client, "collection-buyer")
+    seller_id = seller_session["user"]["id"]
+    buyer_id = buyer_session["user"]["id"]
+    scan_id, _listing_id = run_in_app_loop(client, seed_rare_listing, seller_id)
+
+    bearer_response = client.get("/api/v1/collection", headers=api_headers(seller_session["access_token"]))
+    assert bearer_response.status_code == 200, bearer_response.text
+    bearer_item = next(item for item in bearer_response.json() if item["scan_id"] == scan_id)
+    assert bearer_item["status_code"] == "DIAGNOSTIC_SUCCESS_HIGH"
+    assert bearer_item["is_meteorite"] is True
+    assert bearer_item["class_confidence"] == 0.91
+    assert bearer_item["magnetic"] is True
+    assert bearer_item["latitude"] == 31.6
+    assert bearer_item["longitude"] == -7.9
+    assert bearer_item["interior_image_uri"] is None
+
+    legacy_response = client.get("/api/v1/collection", headers={**api_headers(), "X-User-Id": seller_id})
+    assert legacy_response.status_code == 200, legacy_response.text
+    assert any(item["scan_id"] == scan_id for item in legacy_response.json())
+
+    mismatch_response = client.get(
+        "/api/v1/collection",
+        headers={**api_headers(seller_session["access_token"]), "X-User-Id": buyer_id},
+    )
+    assert mismatch_response.status_code == 403
+    assert error_code(mismatch_response) == "FORBIDDEN"
+
+    detail_response = client.get(
+        f"/api/v1/collection/{scan_id}",
+        headers=api_headers(seller_session["access_token"]),
+    )
+    assert detail_response.status_code == 200, detail_response.text
+    assert detail_response.json()["scan_id"] == scan_id
+
+    delete_response = client.delete(
+        f"/api/v1/collection/{scan_id}",
+        headers=api_headers(seller_session["access_token"]),
+    )
+    assert delete_response.status_code == 200, delete_response.text
+    assert delete_response.json()["ok"] is True
+
+    delete_again_response = client.delete(
+        f"/api/v1/collection/{scan_id}",
+        headers=api_headers(seller_session["access_token"]),
+    )
+    assert delete_again_response.status_code == 200, delete_again_response.text
+    assert delete_again_response.json()["ok"] is True
+
+    after_delete = client.get("/api/v1/collection", headers=api_headers(seller_session["access_token"]))
+    assert after_delete.status_code == 200, after_delete.text
+    assert all(item["scan_id"] != scan_id for item in after_delete.json())
+
+
+def test_scan_interior_update_rejects_non_owner(client: TestClient):
+    owner_session = register_user(client, "interior-owner")
+    intruder_session = register_user(client, "interior-intruder")
+    scan_id = run_in_app_loop(client, seed_scan_for_interior_update, owner_session["user"]["id"])
+
+    response = client.patch(
+        f"/api/v1/scan/{scan_id}/interior",
+        headers=api_headers(intruder_session["access_token"]),
+        files={"file_interior": ("interior.jpg", b"fake", "image/jpeg")},
+    )
+
+    assert response.status_code == 404
+    assert error_code(response) == "NOT_FOUND"
+
+
+def test_marketplace_publish_persists_required_vendor_data_and_public_contract(client: TestClient):
+    seller_session = register_user(client, "publish")
+    seller_id = seller_session["user"]["id"]
+    scan_id = run_in_app_loop(client, seed_publishable_scan_without_weight, seller_id)
+    seller_headers = api_headers(seller_session["access_token"])
+
+    publish_response = client.post(
+        f"/api/v1/marketplace/publish/{scan_id}",
+        headers=seller_headers,
+        json={
+            "title": "Chondrite Tissint verifiee",
+            "price": 4300.0,
+            "price_mode": "fixed_total",
+            "weight_g": 31.5,
+            "region": "Tata",
+            "description": "Fragment verifie avec coupe interieure disponible.",
+        },
+    )
+
+    assert publish_response.status_code == 200, publish_response.text
+    published = publish_response.json()
+    listing_id = published["listing_id"]
+    assert published["weight"] == 31.5
+    assert published["weight_g"] == 31.5
+    assert published["region"] == "Tata"
+    assert published["description"] == "Fragment verifie avec coupe interieure disponible."
+    assert published["meteorite_probability"] == 0.88
+    assert published["fusion_score"] == 0.88
+    assert published["class_confidence"] == 0.74
+    assert published["confidence"] == 0.74
+    assert published["interior_image_uri"].startswith("/storage/")
+    assert len(published["gallery_images"]) == 3
+    assert published["main_image_uri"] in published["gallery_images"]
+    assert published["interior_image_uri"] in published["gallery_images"]
+    assert run_in_app_loop(client, load_scan_weight, scan_id) == 31.5
+
+    listings_response = client.get("/api/v1/marketplace/listings", headers=api_headers())
+    assert listings_response.status_code == 200, listings_response.text
+    listing = next(item for item in listings_response.json() if item["listing_id"] == listing_id)
+    assert listing["weight_g"] == 31.5
+    assert listing["meteorite_probability"] == 0.88
+    assert listing["fusion_score"] == 0.88
+    assert listing["class_confidence"] == 0.74
+    assert listing["can_contact"] is False
+    assert listing["contact_lock_reason"] == "premium_required"
+    assert listing["interior_image_uri"] == published["interior_image_uri"]
+
+    detail_response = client.get(f"/api/v1/marketplace/listings/{listing_id}", headers=api_headers())
+    assert detail_response.status_code == 200, detail_response.text
+    detail = detail_response.json()
+    assert detail["listing_id"] == listing_id
+    assert detail["weight_g"] == 31.5
+    assert detail["region"] == "Tata"
+    assert detail["price"] == 4300.0
+    assert detail["description"] == "Fragment verifie avec coupe interieure disponible."
+    assert detail["gallery_images"] == listing["gallery_images"]
+
+
+def test_marketplace_publish_rejects_missing_required_vendor_data(client: TestClient):
+    seller_session = register_user(client, "publish-required")
+    seller_id = seller_session["user"]["id"]
+    scan_id = run_in_app_loop(client, seed_publishable_scan_without_weight, seller_id)
+    seller_headers = api_headers(seller_session["access_token"])
+    base_payload = {
+        "title": "Chondrite Tissint verifiee",
+        "price": 4300.0,
+        "price_mode": "fixed_total",
+        "weight_g": 31.5,
+        "region": "Tata",
+        "description": "Fragment verifie avec coupe interieure disponible.",
+    }
+
+    for missing_field in ["title", "price", "weight_g", "region", "description"]:
+        payload = dict(base_payload)
+        payload.pop(missing_field)
+        response = client.post(
+            f"/api/v1/marketplace/publish/{scan_id}",
+            headers=seller_headers,
+            json=payload,
+        )
+        assert response.status_code == 400, response.text
+        assert error_code(response) == "VALIDATION_ERROR"
 
 
 def test_admin_radar_requires_admin_and_writes_audit_log(client: TestClient):

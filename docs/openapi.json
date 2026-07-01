@@ -805,6 +805,22 @@
         "operationId": "get_quota_me_api_v1_quota_me_get",
         "parameters": [
           {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
             "name": "x-user-id",
             "in": "header",
             "required": false,
@@ -1759,6 +1775,38 @@
         "operationId": "scan_exterior_api_v1_scan_exterior_post",
         "parameters": [
           {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          },
+          {
             "name": "Accept-Language",
             "in": "header",
             "required": false,
@@ -1933,6 +1981,38 @@
             }
           },
           {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          },
+          {
             "name": "Accept-Language",
             "in": "header",
             "required": false,
@@ -2097,6 +2177,22 @@
         "summary": "List Collection",
         "operationId": "list_collection_api_v1_collection_get",
         "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
           {
             "name": "x-user-id",
             "in": "header",
@@ -2266,6 +2362,22 @@
             }
           },
           {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
             "name": "x-user-id",
             "in": "header",
             "required": false,
@@ -2428,6 +2540,22 @@
             }
           },
           {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
             "name": "x-user-id",
             "in": "header",
             "required": false,
@@ -2460,6 +2588,184 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CollectionItemResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Requete invalide",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Cle API invalide ou manquante",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Quota epuise",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Acces interdit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Ressource introuvable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflit metier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Fichier trop volumineux",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Format de fichier non supporte",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Erreur de validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service indisponible",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Erreur interne",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Collection Item",
+        "operationId": "delete_collection_item_api_v1_collection__scan_id__delete",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Scan Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
                 }
               }
             }
@@ -7097,9 +7403,17 @@
             "type": "number",
             "title": "Confidence"
           },
+          "class_confidence": {
+            "type": "number",
+            "title": "Class Confidence"
+          },
           "meteorite_probability": {
             "type": "number",
             "title": "Meteorite Probability"
+          },
+          "fusion_score": {
+            "type": "number",
+            "title": "Fusion Score"
           },
           "price": {
             "type": "number",
@@ -7153,6 +7467,17 @@
               }
             ],
             "title": "Weight"
+          },
+          "weight_g": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight G"
           },
           "magnetic": {
             "anyOf": [
@@ -7295,6 +7620,24 @@
               }
             ],
             "title": "Thumbnail Uri"
+          },
+          "interior_image_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interior Image Uri"
+          },
+          "gallery_images": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Gallery Images"
           }
         },
         "type": "object",
@@ -7304,7 +7647,9 @@
           "status",
           "dominant_class",
           "confidence",
+          "class_confidence",
           "meteorite_probability",
+          "fusion_score",
           "price"
         ],
         "title": "AdminRadarListingResponse"
@@ -7571,6 +7916,10 @@
             "type": "string",
             "title": "Client Uuid"
           },
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
           "files_exterior": {
             "items": {
               "type": "string",
@@ -7634,17 +7983,13 @@
               }
             ],
             "title": "Longitude"
-          },
-          "user_id": {
-            "type": "string",
-            "title": "User Id"
           }
         },
         "type": "object",
         "required": [
           "client_uuid",
-          "files_exterior",
-          "user_id"
+          "user_id",
+          "files_exterior"
         ],
         "title": "Body_scan_exterior_api_v1_scan_exterior_post"
       },
@@ -7739,6 +8084,39 @@
             "type": "string",
             "title": "Status"
           },
+          "status_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Code"
+          },
+          "is_meteorite": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Meteorite"
+          },
+          "class_confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Class Confidence"
+          },
           "created_at": {
             "type": "string",
             "title": "Created At"
@@ -7776,6 +8154,24 @@
             ],
             "title": "Thumbnail Uri"
           },
+          "interior_image_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interior Image Uri"
+          },
+          "gallery_images": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Gallery Images"
+          },
           "weight_g": {
             "anyOf": [
               {
@@ -7786,6 +8182,39 @@
               }
             ],
             "title": "Weight G"
+          },
+          "magnetic": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Magnetic"
+          },
+          "latitude": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latitude"
+          },
+          "longitude": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Longitude"
           },
           "region": {
             "anyOf": [
@@ -8033,6 +8462,18 @@
             "type": "number",
             "title": "Confidence"
           },
+          "class_confidence": {
+            "type": "number",
+            "title": "Class Confidence"
+          },
+          "meteorite_probability": {
+            "type": "number",
+            "title": "Meteorite Probability"
+          },
+          "fusion_score": {
+            "type": "number",
+            "title": "Fusion Score"
+          },
           "price": {
             "type": "number",
             "title": "Price"
@@ -8085,6 +8526,17 @@
               }
             ],
             "title": "Weight"
+          },
+          "weight_g": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight G"
           },
           "magnetic": {
             "anyOf": [
@@ -8164,6 +8616,24 @@
               }
             ],
             "title": "Thumbnail Uri"
+          },
+          "interior_image_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interior Image Uri"
+          },
+          "gallery_images": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Gallery Images"
           }
         },
         "type": "object",
@@ -8175,6 +8645,9 @@
           "is_rare_candidate",
           "dominant_class",
           "confidence",
+          "class_confidence",
+          "meteorite_probability",
+          "fusion_score",
           "price"
         ],
         "title": "MarketplaceListingResponse"
@@ -8552,6 +9025,18 @@
             "type": "number",
             "title": "Confidence"
           },
+          "class_confidence": {
+            "type": "number",
+            "title": "Class Confidence"
+          },
+          "meteorite_probability": {
+            "type": "number",
+            "title": "Meteorite Probability"
+          },
+          "fusion_score": {
+            "type": "number",
+            "title": "Fusion Score"
+          },
           "weight": {
             "anyOf": [
               {
@@ -8562,6 +9047,17 @@
               }
             ],
             "title": "Weight"
+          },
+          "weight_g": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight G"
           },
           "blurred_latitude": {
             "anyOf": [
@@ -8748,6 +9244,24 @@
               }
             ],
             "title": "Thumbnail Uri"
+          },
+          "interior_image_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interior Image Uri"
+          },
+          "gallery_images": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Gallery Images"
           }
         },
         "type": "object",
@@ -8758,6 +9272,9 @@
           "status",
           "dominant_class",
           "confidence",
+          "class_confidence",
+          "meteorite_probability",
+          "fusion_score",
           "weight",
           "blurred_latitude",
           "blurred_longitude"
@@ -8820,6 +9337,19 @@
               }
             ],
             "title": "Region"
+          },
+          "weight_g": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 100000.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight G"
           }
         },
         "type": "object",

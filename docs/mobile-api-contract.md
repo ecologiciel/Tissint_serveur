@@ -25,6 +25,8 @@ Authorization: Bearer <access_token>
 
 Access and refresh tokens are opaque server-side session tokens; only their hashes are persisted.
 
+For authenticated mobile flows, `Authorization: Bearer` is the identity source of truth. The legacy `X-User-Id` header remains accepted for transition and tests, but if it disagrees with the Bearer user the API returns `FORBIDDEN`.
+
 `GET /health` is public and can be used before login or sync.
 
 ## Error Shape
@@ -62,7 +64,8 @@ Marketplace descriptions and titles must not contain direct phone, email, WhatsA
 | Collection list | `GET` | `/api/v1/collection` | `CollectionItemResponse[]` |
 | Add scan to collection | `POST` | `/api/v1/collection/{scan_id}` | `CollectionItemResponse` |
 | Collection detail | `GET` | `/api/v1/collection/{scan_id}` | `CollectionItemResponse` |
-| Publish scan | `POST` JSON `{ price?, title?, description?, price_mode?, region? }` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
+| Remove from collection | `DELETE` | `/api/v1/collection/{scan_id}` | `{ ok: true }` |
+| Publish scan | `POST` JSON `{ price, title, description, price_mode?, region, weight_g? }` | `/api/v1/marketplace/publish/{scan_id}` | `MarketplaceListingResponse` |
 | Marketplace list | `GET` | `/api/v1/marketplace/listings` | `PublicListingItem[]` |
 | Marketplace detail | `GET` | `/api/v1/marketplace/listings/{listing_id}` | `PublicListingItem` |
 | Admin radar list | `GET` | `/api/v1/admin/radar` | `AdminRadarListingResponse[]` |
@@ -83,6 +86,8 @@ Marketplace descriptions and titles must not contain direct phone, email, WhatsA
 - OpenAPI: `docs/openapi.json`
 - TypeScript types: `src/api/generated/types.ts`
 - Reference client: `src/api/tinssitClient.ts`
+
+Marketplace listing payloads expose `fusion_score` / `meteorite_probability` for the Tissint score, `class_confidence` for classification confidence, `weight_g` as the mobile-facing weight alias, and `gallery_images` / `interior_image_uri` when scan media is available. Legacy fields such as `confidence` and `weight` remain for backward compatibility.
 
 Regenerate the contract with:
 

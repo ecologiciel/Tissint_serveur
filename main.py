@@ -73,7 +73,6 @@ from app.services.notifier import send_telegram_radar_alert
 from billing import (
     activate_subscription,
     cancel_subscription,
-    check_scan_quota,
     checkout_payload,
     create_checkout_session,
     create_invoice,
@@ -83,6 +82,7 @@ from billing import (
     normalize_billing_provider,
     quota_limit_for_tier,
     refresh_subscription_state,
+    subscription_is_active,
     subscription_payload,
 )
 
@@ -339,13 +339,81 @@ async def _require_admin_context(
         raise AppProductionException("FORBIDDEN", "Acces admin requis.", 403)
     return user, subscription
 
-def resolve_user_id(x_user_id: Optional[str] = Header(None)) -> str:
-    user_id = (x_user_id or "anonymous").strip()
+def _validate_mobile_user_id(user_id: str) -> str:
     if len(user_id) < 3 or len(user_id) > 100:
         raise AppProductionException("VALIDATION_ERROR", "Identifiant utilisateur invalide.", 400)
     if not all(char.isalnum() or char in {"_", "-"} for char in user_id):
         raise AppProductionException("VALIDATION_ERROR", "Identifiant utilisateur invalide.", 400)
     return user_id
+
+def _normalize_optional_user_id(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    user_id = value.strip()
+    if not user_id:
+        return None
+    return _validate_mobile_user_id(user_id)
+
+def resolve_user_id(x_user_id: Optional[str] = Header(None)) -> str:
+    return _normalize_optional_user_id(x_user_id) or "anonymous"
+
+async def _resolve_mobile_identity(
+    db: AsyncSession,
+    authorization: Optional[str] = None,
+    x_user_id: Optional[str] = None,
+    form_user_id: Optional[str] = None,
+    require_user: bool = False,
+):
+    legacy_ids = [
+        user_id
+        for user_id in (
+            _normalize_optional_user_id(x_user_id),
+            _normalize_optional_user_id(form_user_id),
+        )
+        if user_id and user_id != "anonymous"
+    ]
+    if legacy_ids and any(user_id != legacy_ids[0] for user_id in legacy_ids):
+        raise AppProductionException("FORBIDDEN", "Identifiant utilisateur divergent.", 403)
+
+    if authorization:
+        user, _session, subscription, _token = await _current_auth_context(authorization, db)
+        if legacy_ids and legacy_ids[0] != user.id:
+            raise AppProductionException("FORBIDDEN", "Identifiant utilisateur divergent.", 403)
+        return user.id, user, subscription
+
+    if require_user and not legacy_ids:
+        raise AppProductionException("UNAUTHORIZED", "Session requise.", 401)
+
+    user_id = legacy_ids[0] if legacy_ids else "anonymous"
+    subscription = await get_or_create_subscription(user_id, db)
+    return user_id, None, subscription
+
+async def _check_scan_quota_for_request(
+    db: AsyncSession,
+    authorization: Optional[str],
+    x_user_id: Optional[str],
+    form_user_id: str,
+):
+    user_id, user, subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        form_user_id=form_user_id,
+        require_user=True,
+    )
+    refresh_subscription_state(subscription, user)
+
+    if subscription.tier in {"premium", "admin"} and subscription_is_active(subscription):
+        return user_id, subscription
+
+    if subscription.remaining_tokens <= 0:
+        raise AppProductionException(
+            error_code="QUOTA_EXCEEDED",
+            message="Quota de scans epuise. Passez a la version Premium !",
+            status_code=402,
+        )
+
+    return user_id, subscription
 
 @app.post(
     "/api/v1/auth/register",
@@ -513,11 +581,18 @@ async def logout(
     responses=ERROR_RESPONSES,
 )
 async def get_quota_me(
-    user_id: str = Depends(resolve_user_id),
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
 ):
-    subscription = await get_or_create_subscription(user_id, db)
+    _user_id, user, subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+    )
+    refresh_subscription_state(subscription, user)
+    await db.commit()
     return _quota_response(subscription)
 
 
@@ -725,12 +800,25 @@ def _scan_main_image_uri(scan: ScanModel) -> Optional[str]:
 def _scan_thumbnail_uri(scan: ScanModel) -> Optional[str]:
     return _scan_main_image_uri(scan)
 
+def _scan_interior_image_uri(scan: ScanModel) -> Optional[str]:
+    return storage_provider.public_url(scan.interior_image_path)
+
 def _listing_image_fields(scan: ScanModel) -> dict:
     main_image_uri = _scan_main_image_uri(scan)
+    gallery_images: list[str] = []
+    for stored_path in scan.exterior_images_paths or []:
+        public_url = storage_provider.public_url(stored_path)
+        if public_url and public_url not in gallery_images:
+            gallery_images.append(public_url)
+    interior_image_uri = _scan_interior_image_uri(scan)
+    if interior_image_uri and interior_image_uri not in gallery_images:
+        gallery_images.append(interior_image_uri)
     return {
         "main_image_uri": main_image_uri,
         "image_url": main_image_uri,
         "thumbnail_uri": _scan_thumbnail_uri(scan),
+        "interior_image_uri": interior_image_uri,
+        "gallery_images": gallery_images,
     }
 
 async def _create_notification(
@@ -919,13 +1007,16 @@ def _admin_radar_listing_response(
         status=_effective_listing_status(listing),
         dominant_class=scan.dominant_class,
         confidence=scan.class_confidence,
+        class_confidence=scan.class_confidence,
         meteorite_probability=scan.meteorite_probability,
+        fusion_score=scan.meteorite_probability,
         price=listing.price,
         price_mode=_listing_price_mode(listing),
         title=listing.title or scan.dominant_class,
         description=listing.description,
         region=listing.region,
         weight=scan.weight,
+        weight_g=scan.weight,
         magnetic=scan.magnetic,
         latitude=scan.latitude,
         longitude=scan.longitude,
@@ -959,7 +1050,11 @@ def _public_listing_item(
         status=status_value,
         dominant_class=scan.dominant_class,
         confidence=scan.class_confidence,
+        class_confidence=scan.class_confidence,
+        meteorite_probability=scan.meteorite_probability,
+        fusion_score=scan.meteorite_probability,
         weight=scan.weight,
+        weight_g=scan.weight,
         blurred_latitude=safe_lat,
         blurred_longitude=safe_lon,
         is_rare=_is_rare_candidate(scan.dominant_class, scan.class_confidence),
@@ -1010,8 +1105,14 @@ def _collection_item_response(
         class_name=scan.dominant_class,
         fusion_score=scan.meteorite_probability,
         status=status_value,
+        status_code=scan.status_code,
+        is_meteorite=scan.is_meteorite,
+        class_confidence=scan.class_confidence,
         created_at=collection.created_at.isoformat() if collection.created_at else "",
         weight_g=scan.weight,
+        magnetic=scan.magnetic,
+        latitude=scan.latitude,
+        longitude=scan.longitude,
         region=listing.region if listing else None,
         notes=listing.description if listing else None,
         meteorite_probability=scan.meteorite_probability,
@@ -1035,21 +1136,29 @@ async def _sync_collection_status_for_listing(
 )
 async def scan_exterior(
     client_uuid: str = Form(...),
+    user_id: str = Form(...),
     files_exterior: List[UploadFile] = File(...),
     file_interior: Optional[UploadFile] = File(None),
     weight: Optional[float] = Form(None),
     magnetic: Optional[bool] = Form(None),
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
-    subscription = Depends(check_scan_quota),
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
     accept_language: Optional[str] = Header(None, alias="Accept-Language"),
 ):
+    actor_user_id, subscription = await _check_scan_quota_for_request(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        form_user_id=user_id,
+    )
     try:
         metadata = ScanMetadataInput(
             client_uuid=client_uuid,
-            user_id=subscription.user_id,
+            user_id=actor_user_id,
             weight=weight,
             magnetic=magnetic,
             latitude=latitude,
@@ -1063,6 +1172,8 @@ async def scan_exterior(
     existing_scan = result.scalar_one_or_none()
     
     if existing_scan:
+        if existing_scan.user_id != metadata.user_id:
+            raise AppProductionException("FORBIDDEN", "Identifiant utilisateur divergent.", 403)
         print(f"🔄 [Idempotence] Scan existant récupéré pour client_uuid: {metadata.client_uuid}")
         has_interior_cut = bool(existing_scan.interior_image_path)
         actions = business_orchestrator.build_scan_actions(
@@ -1223,15 +1334,26 @@ async def scan_exterior(
 async def scan_interior_update(
     scan_id: str,
     file_interior: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
     accept_language: Optional[str] = Header(None, alias="Accept-Language"),
 ):
     # 1. Récupération asynchrone du scan de la BDD
+    actor_user_id, _user, _subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        require_user=True,
+    )
     result = await db.execute(select(ScanModel).where(ScanModel.id == scan_id))
     scan = result.scalar_one_or_none()
     
     if not scan:
+        raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
+
+    if scan.user_id != actor_user_id:
         raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
         
     if scan.interior_image_path:
@@ -1313,10 +1435,16 @@ async def scan_interior_update(
     responses=ERROR_RESPONSES,
 )
 async def list_collection(
-    user_id: str = Depends(resolve_user_id),
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
 ):
+    user_id, _user, _subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+    )
     query = (
         select(CollectionItemModel, ScanModel, ListingModel)
         .join(ScanModel, CollectionItemModel.scan_id == ScanModel.id)
@@ -1340,17 +1468,24 @@ async def list_collection(
 )
 async def add_scan_to_collection(
     scan_id: str,
-    user_id: str = Depends(resolve_user_id),
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
 ):
+    user_id, _user, _subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        require_user=True,
+    )
     result = await db.execute(select(ScanModel).where(ScanModel.id == scan_id))
     scan = result.scalar_one_or_none()
 
     if not scan:
         raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
 
-    owner_id = scan.user_id if user_id == "anonymous" else user_id
+    owner_id = user_id
     if scan.user_id != owner_id:
         raise AppProductionException("NOT_FOUND", "Scan introuvable.", 404)
 
@@ -1391,10 +1526,17 @@ async def add_scan_to_collection(
 )
 async def get_collection_item(
     scan_id: str,
-    user_id: str = Depends(resolve_user_id),
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
 ):
+    user_id, _user, _subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        require_user=True,
+    )
     query = (
         select(CollectionItemModel, ScanModel, ListingModel)
         .join(ScanModel, CollectionItemModel.scan_id == ScanModel.id)
@@ -1411,6 +1553,37 @@ async def get_collection_item(
     item = _collection_item_response(collection, scan, listing)
     await db.commit()
     return item
+
+@app.delete(
+    "/api/v1/collection/{scan_id}",
+    response_model=OkResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def delete_collection_item(
+    scan_id: str,
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user_id, _user, _subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        require_user=True,
+    )
+    result = await db.execute(
+        select(CollectionItemModel).where(
+            CollectionItemModel.user_id == user_id,
+            CollectionItemModel.scan_id == scan_id,
+        )
+    )
+    collection = result.scalar_one_or_none()
+    if collection:
+        await db.delete(collection)
+        await db.commit()
+    return OkResponse(ok=True)
 
 @app.post(
     "/api/v1/marketplace/publish/{scan_id}",
@@ -1452,6 +1625,23 @@ async def publish_to_marketplace(
             "La description contient des coordonnees directes.",
             400,
         )
+    final_weight = payload.weight_g if payload.weight_g is not None else scan.weight
+    if (
+        title is None
+        or description is None
+        or region is None
+        or payload.price is None
+        or payload.price <= 0
+        or final_weight is None
+        or final_weight <= 0
+    ):
+        raise AppProductionException(
+            "VALIDATION_ERROR",
+            "Titre, description, region, prix et poids sont obligatoires pour publier.",
+            400,
+        )
+    if payload.weight_g is not None:
+        scan.weight = payload.weight_g
 
     # Extraction des valeurs de notre BDD
     dominant_class = scan.dominant_class
@@ -1462,7 +1652,7 @@ async def publish_to_marketplace(
     is_rare = _is_rare_candidate(dominant_class, confidence)
     target_status = _marketplace_status_for_publish(scan, is_rare)
 
-    listing_price = payload.price if payload.price is not None else 0.0
+    listing_price = payload.price
     listing_result = await db.execute(select(ListingModel).where(ListingModel.scan_id == scan_id))
     listing = listing_result.scalar_one_or_none()
     previous_status = _legacy_listing_status(listing.status) if listing else None
@@ -1471,14 +1661,10 @@ async def publish_to_marketplace(
         if previous_status in MARKETPLACE_LOCKED_FOR_SELLER_STATUSES:
             raise AppProductionException("CONFLICT", "Cette annonce ne peut plus etre modifiee.", 409)
         listing.status = target_status
-        if payload.price is not None:
-            listing.price = listing_price
-        if title is not None:
-            listing.title = title
-        if payload.description is not None:
-            listing.description = description
-        if payload.region is not None:
-            listing.region = region
+        listing.price = listing_price
+        listing.title = title
+        listing.description = description
+        listing.region = region
         listing.price_mode = payload.price_mode
     else:
         listing = ListingModel(
@@ -1486,7 +1672,7 @@ async def publish_to_marketplace(
             scan_id=scan_id,
             price=listing_price,
             status=target_status,
-            title=title or dominant_class,
+            title=title,
             description=description,
             price_mode=payload.price_mode,
             region=region,
@@ -1528,12 +1714,16 @@ async def publish_to_marketplace(
         is_rare_candidate=is_rare,
         dominant_class=dominant_class,
         confidence=confidence,
+        class_confidence=confidence,
+        meteorite_probability=scan.meteorite_probability,
+        fusion_score=scan.meteorite_probability,
         price=listing.price,
         price_mode=_listing_price_mode(listing),
         title=listing.title,
         description=listing.description,
         region=listing.region,
         weight=scan.weight,
+        weight_g=scan.weight,
         magnetic=scan.magnetic,
         blurred_latitude=safe_lat,
         blurred_longitude=safe_lon,

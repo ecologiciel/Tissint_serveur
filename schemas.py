@@ -99,6 +99,7 @@ class PublishListingInput(BaseModel):
     description: Optional[str] = Field(None, max_length=1000)
     price_mode: str = "fixed_total"
     region: Optional[str] = Field(None, min_length=1, max_length=120)
+    weight_g: Optional[float] = Field(None, gt=0.0, le=100000.0)
 
     @field_validator("price_mode")
     @classmethod
@@ -117,12 +118,16 @@ class MarketplaceListingResponse(BaseModel):
     is_rare_candidate: bool
     dominant_class: str
     confidence: float
+    class_confidence: float
+    meteorite_probability: float
+    fusion_score: float
     price: float
     price_mode: str = "fixed_total"
     title: Optional[str] = None
     description: Optional[str] = None
     region: Optional[str] = None
     weight: Optional[float] = None
+    weight_g: Optional[float] = None
     magnetic: Optional[bool] = None
     blurred_latitude: Optional[float] = Field(None, description="Latitude floutée pour anonymisation (précision ~11km)")
     blurred_longitude: Optional[float] = Field(None, description="Longitude floutée pour anonymisation (précision ~11km)")
@@ -130,6 +135,8 @@ class MarketplaceListingResponse(BaseModel):
     main_image_uri: Optional[str] = None
     image_url: Optional[str] = None
     thumbnail_uri: Optional[str] = None
+    interior_image_uri: Optional[str] = None
+    gallery_images: List[str] = Field(default_factory=list)
 
 class PublicListingItem(BaseModel):
     listing_id: str
@@ -138,7 +145,11 @@ class PublicListingItem(BaseModel):
     status: str
     dominant_class: str
     confidence: float
+    class_confidence: float
+    meteorite_probability: float
+    fusion_score: float
     weight: Optional[float]
+    weight_g: Optional[float] = None
     blurred_latitude: Optional[float]
     blurred_longitude: Optional[float]
     is_rare: bool = False
@@ -158,6 +169,8 @@ class PublicListingItem(BaseModel):
     main_image_uri: Optional[str] = None
     image_url: Optional[str] = None
     thumbnail_uri: Optional[str] = None
+    interior_image_uri: Optional[str] = None
+    gallery_images: List[str] = Field(default_factory=list)
 
 class AdminRadarListingResponse(BaseModel):
     listing_id: str
@@ -165,13 +178,16 @@ class AdminRadarListingResponse(BaseModel):
     status: str
     dominant_class: str
     confidence: float
+    class_confidence: float
     meteorite_probability: float
+    fusion_score: float
     price: float
     price_mode: str = "fixed_total"
     title: Optional[str] = None
     description: Optional[str] = None
     region: Optional[str] = None
     weight: Optional[float] = None
+    weight_g: Optional[float] = None
     magnetic: Optional[bool] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -186,6 +202,8 @@ class AdminRadarListingResponse(BaseModel):
     main_image_uri: Optional[str] = None
     image_url: Optional[str] = None
     thumbnail_uri: Optional[str] = None
+    interior_image_uri: Optional[str] = None
+    gallery_images: List[str] = Field(default_factory=list)
 
 class AdminListingActionInput(BaseModel):
     reason: Optional[str] = Field(None, max_length=500)
@@ -266,11 +284,19 @@ class CollectionItemResponse(BaseModel):
     class_name: str
     fusion_score: float
     status: str
+    status_code: Optional[str] = None
+    is_meteorite: Optional[bool] = None
+    class_confidence: Optional[float] = None
     created_at: str
     main_image_uri: Optional[str] = None
     image_url: Optional[str] = None
     thumbnail_uri: Optional[str] = None
+    interior_image_uri: Optional[str] = None
+    gallery_images: List[str] = Field(default_factory=list)
     weight_g: Optional[float] = None
+    magnetic: Optional[bool] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     region: Optional[str] = None
     notes: Optional[str] = None
     meteorite_probability: Optional[float] = None
