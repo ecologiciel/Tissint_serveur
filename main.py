@@ -38,6 +38,7 @@ from schemas import (
     ScanDecisionResponse,
     ScanMetadataInput,
     PublishListingInput,
+    UpdateListingInput,
     MarketplaceListingResponse,
     PublicListingItem,
     AdminActionResponse,
@@ -881,6 +882,7 @@ MARKETPLACE_LOCKED_FOR_SELLER_STATUSES = {
     "sold",
     "rejected",
     "archived",
+    "removed",
 }
 CONTACT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 CONTACT_PHONE_RE = re.compile(r"(?:\+?\d[\s().-]?){8,}")
@@ -943,7 +945,7 @@ def _contact_lock_reason(viewer_role: str, status_value: str) -> Optional[str]:
         return None
     if status_value == "institutional_hold_24h":
         return "institutional_hold_24h"
-    if status_value in {"sold", "rejected", "archived"}:
+    if status_value in {"sold", "rejected", "archived", "removed"}:
         return "listing_unavailable"
     if viewer_role not in {"premium", "admin"}:
         return "premium_required"
@@ -1804,6 +1806,170 @@ async def get_marketplace_listing_detail(
     if _effective_listing_status(listing) not in MARKETPLACE_VISIBLE_STATUSES and viewer_role != "admin":
         raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
     return _public_listing_item(listing, scan, seller, viewer_role)
+
+
+async def _marketplace_listing_row(
+    listing_id: str,
+    db: AsyncSession,
+):
+    query = (
+        select(ListingModel, ScanModel, UserModel)
+        .join(ScanModel, ListingModel.scan_id == ScanModel.id)
+        .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
+        .where(ListingModel.id == listing_id)
+    )
+    result = await db.execute(query)
+    row = result.first()
+    if not row:
+        raise AppProductionException("NOT_FOUND", "Annonce introuvable.", 404)
+    return row
+
+
+def _is_admin_actor(user: UserModel, subscription) -> bool:
+    return user.role == "admin" or subscription.tier == "admin"
+
+
+def _ensure_listing_actor(user: UserModel, subscription, scan: ScanModel) -> bool:
+    is_admin = _is_admin_actor(user, subscription)
+    if not is_admin and scan.user_id != user.id:
+        raise AppProductionException("FORBIDDEN", "Action non autorisee sur cette annonce.", 403)
+    return is_admin
+
+
+def _ensure_listing_can_mutate(listing: ListingModel, is_admin: bool, action: str) -> str:
+    current_status = _effective_listing_status(listing)
+    if current_status == "removed":
+        raise AppProductionException("CONFLICT", "Cette annonce est deja retiree.", 409)
+    if current_status in {"archived", "rejected"}:
+        raise AppProductionException("CONFLICT", "Cette annonce ne peut plus etre modifiee.", 409)
+    if current_status == "sold" and action != "sold":
+        raise AppProductionException("CONFLICT", "Cette annonce est deja vendue.", 409)
+    if current_status == "admin_reserved" and not is_admin:
+        raise AppProductionException("CONFLICT", "Cette annonce est reservee par l'administration.", 409)
+    return current_status
+
+
+@app.patch(
+    "/api/v1/marketplace/listings/{listing_id}",
+    response_model=PublicListingItem,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def update_marketplace_listing(
+    listing_id: str,
+    payload: UpdateListingInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    listing, scan, seller = await _marketplace_listing_row(listing_id, db)
+    is_admin = _ensure_listing_actor(user, subscription, scan)
+    previous_status = _ensure_listing_can_mutate(listing, is_admin, "update")
+    fields_set = getattr(payload, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = set(payload.dict(exclude_unset=True).keys())
+
+    title = _clean_optional_text(payload.title) if "title" in fields_set else listing.title
+    description = _clean_optional_text(payload.description) if "description" in fields_set else listing.description
+    if _contains_contact_leak(title) or _contains_contact_leak(description):
+        raise AppProductionException(
+            "CONTACT_LEAK_DETECTED",
+            "La description contient des coordonnees directes.",
+            400,
+        )
+
+    if "price" in fields_set and payload.price is not None:
+        listing.price = payload.price
+    if "title" in fields_set:
+        listing.title = title
+    if "description" in fields_set:
+        listing.description = description
+    if "price_mode" in fields_set and payload.price_mode is not None:
+        listing.price_mode = payload.price_mode
+    if "region" in fields_set:
+        listing.region = _clean_optional_text(payload.region)
+    if "weight_g" in fields_set and payload.weight_g is not None:
+        scan.weight = payload.weight_g
+
+    await _sync_collection_status_for_listing(db, scan, listing)
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="marketplace_update_listing",
+        entity_type="listing",
+        entity_id=listing.id,
+        metadata={"scan_id": scan.id, "previous_status": previous_status},
+    )
+    await db.commit()
+    await db.refresh(listing)
+    await db.refresh(scan)
+    return _public_listing_item(listing, scan, seller, subscription.tier)
+
+
+@app.post(
+    "/api/v1/marketplace/listings/{listing_id}/sold",
+    response_model=PublicListingItem,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def mark_marketplace_listing_sold(
+    listing_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    listing, scan, seller = await _marketplace_listing_row(listing_id, db)
+    is_admin = _ensure_listing_actor(user, subscription, scan)
+    previous_status = _ensure_listing_can_mutate(listing, is_admin, "sold")
+
+    listing.status = "sold"
+    await _sync_collection_status_for_listing(db, scan, listing)
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="marketplace_mark_listing_sold",
+        entity_type="listing",
+        entity_id=listing.id,
+        metadata={"scan_id": scan.id, "previous_status": previous_status, "new_status": "sold"},
+    )
+    await db.commit()
+    await db.refresh(listing)
+    return _public_listing_item(listing, scan, seller, subscription.tier)
+
+
+@app.delete(
+    "/api/v1/marketplace/listings/{listing_id}",
+    response_model=PublicListingItem,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def remove_marketplace_listing(
+    listing_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    listing, scan, seller = await _marketplace_listing_row(listing_id, db)
+    is_admin = _ensure_listing_actor(user, subscription, scan)
+    previous_status = _effective_listing_status(listing)
+    if previous_status != "removed":
+        _ensure_listing_can_mutate(listing, is_admin, "remove")
+        listing.status = "removed"
+        await _sync_collection_status_for_listing(db, scan, listing)
+        await _write_audit_log(
+            db,
+            actor_user_id=user.id,
+            action="marketplace_remove_listing",
+            entity_type="listing",
+            entity_id=listing.id,
+            metadata={"scan_id": scan.id, "previous_status": previous_status, "new_status": "removed"},
+        )
+        await db.commit()
+        await db.refresh(listing)
+    return _public_listing_item(listing, scan, seller, subscription.tier)
 
 
 @app.get(

@@ -109,6 +109,24 @@ class PublishListingInput(BaseModel):
             raise ValueError("Mode de prix invalide.")
         return value
 
+class UpdateListingInput(BaseModel):
+    price: Optional[float] = Field(None, ge=0.0)
+    title: Optional[str] = Field(None, min_length=1, max_length=120)
+    description: Optional[str] = Field(None, max_length=1000)
+    price_mode: Optional[str] = None
+    region: Optional[str] = Field(None, min_length=1, max_length=120)
+    weight_g: Optional[float] = Field(None, gt=0.0, le=100000.0)
+
+    @field_validator("price_mode")
+    @classmethod
+    def validate_price_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        allowed = {"fixed_total", "price_per_gram", "negotiable", "on_request"}
+        if value not in allowed:
+            raise ValueError("Mode de prix invalide.")
+        return value
+
 class MarketplaceListingResponse(BaseModel):
     ok: bool = True
     status: str

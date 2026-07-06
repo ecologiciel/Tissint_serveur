@@ -431,6 +431,15 @@ export type UiMessageResponse = {
   "created_at": string;
 };
 
+export type UpdateListingInput = {
+  "price"?: number | null;
+  "title"?: string | null;
+  "description"?: string | null;
+  "price_mode"?: string | null;
+  "region"?: string | null;
+  "weight_g"?: number | null;
+};
+
 export type WalletResponse = {
   "balance": number;
   "currency"?: string;
@@ -506,6 +515,7 @@ export type ApiSchemas = {
   "SendMessageInput": SendMessageInput;
   "SubscriptionResponse": SubscriptionResponse;
   "UiMessageResponse": UiMessageResponse;
+  "UpdateListingInput": UpdateListingInput;
   "WalletResponse": WalletResponse;
   "WalletTransactionResponse": WalletTransactionResponse;
   "WithdrawInput": WithdrawInput;

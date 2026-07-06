@@ -772,6 +772,104 @@ def test_marketplace_publish_rejects_missing_required_vendor_data(client: TestCl
         assert error_code(response) == "VALIDATION_ERROR"
 
 
+def test_marketplace_owner_actions_update_sold_and_soft_delete(client: TestClient):
+    seller_session = register_user(client, "listing-actions")
+    intruder_session = register_user(client, "listing-intruder")
+    seller_id = seller_session["user"]["id"]
+    seller_headers = api_headers(seller_session["access_token"])
+    intruder_headers = api_headers(intruder_session["access_token"])
+
+    scan_id = run_in_app_loop(client, seed_publishable_scan_without_weight, seller_id)
+    publish_response = client.post(
+        f"/api/v1/marketplace/publish/{scan_id}",
+        headers=seller_headers,
+        json={
+            "title": "Chondrite avant update",
+            "price": 4100.0,
+            "price_mode": "fixed_total",
+            "weight_g": 31.5,
+            "region": "Tata",
+            "description": "Annonce a modifier sans coordonnees directes.",
+        },
+    )
+    assert publish_response.status_code == 200, publish_response.text
+    listing_id = publish_response.json()["listing_id"]
+
+    intruder_update = client.patch(
+        f"/api/v1/marketplace/listings/{listing_id}",
+        headers=intruder_headers,
+        json={"price": 1.0},
+    )
+    assert intruder_update.status_code == 403
+    assert error_code(intruder_update) == "FORBIDDEN"
+
+    update_response = client.patch(
+        f"/api/v1/marketplace/listings/{listing_id}",
+        headers=seller_headers,
+        json={
+            "title": "Chondrite apres update",
+            "price": 4550.0,
+            "price_mode": "negotiable",
+            "weight_g": 35.0,
+            "region": "Ouarzazate",
+            "description": "Description corrigee sans contact.",
+        },
+    )
+    assert update_response.status_code == 200, update_response.text
+    updated = update_response.json()
+    assert updated["listing_id"] == listing_id
+    assert updated["title"] == "Chondrite apres update"
+    assert updated["price"] == 4550.0
+    assert updated["price_mode"] == "negotiable"
+    assert updated["weight_g"] == 35.0
+    assert updated["region"] == "Ouarzazate"
+
+    sold_response = client.post(f"/api/v1/marketplace/listings/{listing_id}/sold", headers=seller_headers)
+    assert sold_response.status_code == 200, sold_response.text
+    assert sold_response.json()["status"] == "sold"
+
+    update_after_sold = client.patch(
+        f"/api/v1/marketplace/listings/{listing_id}",
+        headers=seller_headers,
+        json={"price": 5000.0},
+    )
+    assert update_after_sold.status_code == 409
+    assert error_code(update_after_sold) == "CONFLICT"
+
+    removable_scan_id = run_in_app_loop(client, seed_publishable_scan_without_weight, seller_id)
+    removable_publish = client.post(
+        f"/api/v1/marketplace/publish/{removable_scan_id}",
+        headers=seller_headers,
+        json={
+            "title": "Annonce a retirer",
+            "price": 1200.0,
+            "price_mode": "fixed_total",
+            "weight_g": 22.0,
+            "region": "Tata",
+            "description": "Annonce de test pour retrait soft delete.",
+        },
+    )
+    assert removable_publish.status_code == 200, removable_publish.text
+    removable_listing_id = removable_publish.json()["listing_id"]
+
+    delete_response = client.delete(f"/api/v1/marketplace/listings/{removable_listing_id}", headers=seller_headers)
+    assert delete_response.status_code == 200, delete_response.text
+    assert delete_response.json()["status"] == "removed"
+
+    public_detail = client.get(f"/api/v1/marketplace/listings/{removable_listing_id}", headers=api_headers())
+    assert public_detail.status_code == 404
+    assert error_code(public_detail) == "NOT_FOUND"
+
+    public_list = client.get("/api/v1/marketplace/listings", headers=api_headers())
+    assert public_list.status_code == 200, public_list.text
+    assert all(item["listing_id"] != removable_listing_id for item in public_list.json())
+
+    my_listings = client.get("/api/v1/marketplace/my-listings", headers=seller_headers)
+    assert my_listings.status_code == 200, my_listings.text
+    removed_item = next(item for item in my_listings.json() if item["listing_id"] == removable_listing_id)
+    assert removed_item["status"] == "removed"
+
+
 def test_admin_radar_requires_admin_and_writes_audit_log(client: TestClient):
     seller_session = register_user(client, "seller")
     admin_session = register_user(client, "admin")
