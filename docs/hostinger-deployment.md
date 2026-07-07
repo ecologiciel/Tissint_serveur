@@ -70,6 +70,13 @@ API_DOMAIN=api.tissint.ma PROXY_STACK=auto bash scripts/hostinger_enable_https_a
 
 The script refuses to continue if DNS is not pointing at the VPS or if local backend health fails. It uses Nginx when Nginx is already present; otherwise it installs Caddy for automatic TLS.
 
+For the temporary Hostinger hostname, run it with the DNS guard disabled because `/etc/hosts` can resolve the local hostname to `127.0.1.1` from inside the VPS even when public DNS is correct:
+
+```bash
+cd /opt/tissint/backend
+SKIP_DNS_CHECK=1 API_DOMAIN=srv1610573.hstgr.cloud PROXY_STACK=auto bash scripts/hostinger_enable_https_api.sh
+```
+
 After `https://api.tissint.ma/health` returns `database=ok`, update the Vercel production environment to:
 
 ```text

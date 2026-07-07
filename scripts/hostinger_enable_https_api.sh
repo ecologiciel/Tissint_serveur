@@ -64,6 +64,7 @@ install_nginx_proxy() {
   cat >"/etc/nginx/sites-available/tissint-api.conf" <<NGINX
 server {
     listen 80;
+    listen [::]:80;
     server_name ${API_DOMAIN};
 
     client_max_body_size 32m;
