@@ -86,6 +86,12 @@ HOSTINGER_API_KEY=<same value as backend API_KEY>
 
 Remove `ALLOW_INSECURE_HOSTINGER_ORIGIN`, redeploy Vercel, and only then close public port `8000` in the Hostinger firewall. Keep `80` and `443` open.
 
+If no custom domain has been purchased yet, use the Hostinger hostname instead:
+
+```text
+HOSTINGER_API_ORIGIN=https://srv1610573.hstgr.cloud
+```
+
 From the mobile app repository, the guarded Vercel switch is:
 
 ```powershell
@@ -93,6 +99,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\switch-vercel-hostin
 ```
 
 The script checks `https://api.tissint.ma/health` before changing Vercel and then smokes the Vercel proxy.
+
+After the Vercel smoke tests pass, pull the latest backend and recreate the API container so Docker binds port `8000` to localhost only:
+
+```bash
+cd /opt/tissint/backend
+git pull --ff-only origin main
+docker compose up -d --build api_server
+curl http://127.0.0.1:8000/health
+curl https://srv1610573.hstgr.cloud/health
+```
+
+At that point, direct public access to `72.62.236.197:8000` is no longer needed.
 
 ## Mobile Configuration
 

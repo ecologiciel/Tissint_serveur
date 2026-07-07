@@ -27,7 +27,7 @@ services:
       postgres_db:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-SecretProductionPassword2026}@postgres_db:5432/${DB_NAME:-meteorite_db}
       API_KEY: ${API_KEY:-meteorite_secret_prod_key_2026}
