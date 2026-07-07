@@ -13,7 +13,7 @@ os.environ.setdefault(
 os.environ.setdefault("STORAGE_DIR", os.getenv("TEST_STORAGE_DIR", ".runtime/test-storage"))
 
 from business_logic import BusinessOrchestrator, HESITANT_THRESHOLD, SUCCESS_THRESHOLD
-from billing import PREMIUM_DAILY_SCAN_LIMIT
+from billing import PREMIUM_DAILY_SCAN_LIMIT, UNLIMITED_SCAN_LIMIT
 from database import AsyncSessionLocal, CollectionItemModel, ListingModel, ScanModel, UserModel, UserSubscription
 from fusion_engine import MeteoriteFusionEngine
 import main as main_module
@@ -39,7 +39,7 @@ def unique_suffix() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def register_user(client: TestClient, prefix: str = "ci") -> dict:
+def register_user(client: TestClient, prefix: str = "ci", email: str | None = None) -> dict:
     suffix = unique_suffix()
     response = client.post(
         "/api/v1/auth/register",
@@ -48,7 +48,7 @@ def register_user(client: TestClient, prefix: str = "ci") -> dict:
             "first_name": "CI",
             "last_name": prefix,
             "phone": f"+2127{suffix[:9]}",
-            "email": f"{prefix}-{suffix}@example.com",
+            "email": email or f"{prefix}-{suffix}@example.com",
             "password": "SecurePass123!",
             "desired_role": "free",
             "device_id": f"ci-{prefix}",
@@ -78,6 +78,23 @@ async def promote_user_to_admin(user_id: str) -> None:
         subscription.status = "active"
         subscription.remaining_tokens = PREMIUM_DAILY_SCAN_LIMIT
         await db.commit()
+
+
+async def set_remaining_tokens(user_id: str, tokens: int) -> None:
+    async with AsyncSessionLocal() as db:
+        subscription = await db.get(UserSubscription, user_id)
+        assert subscription is not None
+        subscription.tier = "free"
+        subscription.status = "none"
+        subscription.remaining_tokens = tokens
+        await db.commit()
+
+
+async def read_remaining_tokens(user_id: str) -> int:
+    async with AsyncSessionLocal() as db:
+        subscription = await db.get(UserSubscription, user_id)
+        assert subscription is not None
+        return subscription.remaining_tokens
 
 
 async def seed_rare_listing(user_id: str) -> tuple[str, str]:
@@ -493,6 +510,78 @@ def test_scan_validation_and_error_envelope(client: TestClient):
     )
     assert invalid_file_type.status_code == 415
     assert error_code(invalid_file_type) == "INVALID_FILE_FORMAT"
+
+
+def test_unlimited_scan_email_bypasses_quota_only_for_configured_account(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeVisionPipeline:
+        def process_full_scan(self, list_exterior_bytes: list[bytes], interior_bytes: bytes | None = None) -> dict:
+            assert len(list_exterior_bytes) == 3
+            model_output = {"prob_bin": 0.91, "prob_sub": [0.03, 0.03, 0.03, 0.82, 0.04, 0.05]}
+            return {
+                "exterior": {
+                    "dino": model_output,
+                    "swin": model_output,
+                    "convnext": model_output,
+                }
+            }
+
+    monkeypatch.setattr(main_module, "vision_pipeline", FakeVisionPipeline())
+
+    unlimited_email = f"quota-unlimited-{unique_suffix()}@example.com"
+    monkeypatch.setenv("UNLIMITED_SCAN_EMAILS", unlimited_email.upper())
+    unlimited_session = register_user(client, "quota-unlimited", email=unlimited_email)
+    normal_session = register_user(client, "quota-normal")
+
+    unlimited_user_id = unlimited_session["user"]["id"]
+    normal_user_id = normal_session["user"]["id"]
+    run_in_app_loop(client, set_remaining_tokens, unlimited_user_id, 0)
+    run_in_app_loop(client, set_remaining_tokens, normal_user_id, 0)
+
+    unlimited_quota = client.get(
+        "/api/v1/quota/me",
+        headers=api_headers(unlimited_session["access_token"]),
+    )
+    assert unlimited_quota.status_code == 200, unlimited_quota.text
+    assert unlimited_quota.json()["role"] == "free"
+    assert unlimited_quota.json()["daily_limit"] == UNLIMITED_SCAN_LIMIT
+    assert unlimited_quota.json()["remaining_today"] == UNLIMITED_SCAN_LIMIT
+
+    normal_quota = client.get(
+        "/api/v1/quota/me",
+        headers=api_headers(normal_session["access_token"]),
+    )
+    assert normal_quota.status_code == 200, normal_quota.text
+    assert normal_quota.json()["remaining_today"] == 0
+
+    normal_scan = client.post(
+        "/api/v1/scan/exterior",
+        headers=api_headers(normal_session["access_token"]),
+        data={"client_uuid": f"normal-quota-{unique_suffix()}", "user_id": normal_user_id},
+        files=[
+            ("files_exterior", ("one.jpg", b"jpeg-one", "image/jpeg")),
+            ("files_exterior", ("two.jpg", b"jpeg-two", "image/jpeg")),
+            ("files_exterior", ("three.jpg", b"jpeg-three", "image/jpeg")),
+        ],
+    )
+    assert normal_scan.status_code == 402
+    assert error_code(normal_scan) == "QUOTA_EXCEEDED"
+
+    unlimited_scan = client.post(
+        "/api/v1/scan/exterior",
+        headers=api_headers(unlimited_session["access_token"]),
+        data={"client_uuid": f"unlimited-quota-{unique_suffix()}", "user_id": unlimited_user_id},
+        files=[
+            ("files_exterior", ("one.jpg", b"jpeg-one", "image/jpeg")),
+            ("files_exterior", ("two.jpg", b"jpeg-two", "image/jpeg")),
+            ("files_exterior", ("three.jpg", b"jpeg-three", "image/jpeg")),
+        ],
+    )
+    assert unlimited_scan.status_code == 200, unlimited_scan.text
+    assert unlimited_scan.json()["scan_id"]
+    assert run_in_app_loop(client, read_remaining_tokens, unlimited_user_id) == 0
 
 
 def test_scan_idempotent_response_includes_localized_message(client: TestClient):

@@ -80,11 +80,13 @@ from billing import (
     decrement_quota,
     get_or_create_subscription,
     invoice_payload,
+    is_unlimited_scan_user,
     normalize_billing_provider,
     quota_limit_for_tier,
     refresh_subscription_state,
     subscription_is_active,
     subscription_payload,
+    UNLIMITED_SCAN_LIMIT,
 )
 
 # Import of our processing modules
@@ -224,9 +226,16 @@ def _normalize_email(email: Optional[str]) -> Optional[str]:
 def _normalize_phone(phone: str) -> str:
     return phone.strip()
 
-def _quota_response(subscription) -> QuotaResponse:
+def _quota_response(subscription, user: UserModel | None = None) -> QuotaResponse:
     subscription_state = subscription_payload(subscription)
     role = subscription_state["role"]
+    if is_unlimited_scan_user(user):
+        return QuotaResponse(
+            role=role,
+            daily_limit=UNLIMITED_SCAN_LIMIT,
+            remaining_today=UNLIMITED_SCAN_LIMIT,
+            resets_at=None,
+        )
     daily_limit = quota_limit_for_tier(role)
     remaining_today = daily_limit if role in {"premium", "admin"} else max(subscription.remaining_tokens, 0)
     return QuotaResponse(
@@ -293,7 +302,7 @@ async def _auth_response(
         refresh_token=refresh_token,
         expires_at=session.access_expires_at.isoformat(),
         user=_auth_user_response(user, subscription),
-        quota=_quota_response(subscription),
+        quota=_quota_response(subscription, user),
     )
 
 async def _current_auth_context(
@@ -404,8 +413,11 @@ async def _check_scan_quota_for_request(
     )
     refresh_subscription_state(subscription, user)
 
+    if is_unlimited_scan_user(user):
+        return user_id, user, subscription
+
     if subscription.tier in {"premium", "admin"} and subscription_is_active(subscription):
-        return user_id, subscription
+        return user_id, user, subscription
 
     if subscription.remaining_tokens <= 0:
         raise AppProductionException(
@@ -414,7 +426,7 @@ async def _check_scan_quota_for_request(
             status_code=402,
         )
 
-    return user_id, subscription
+    return user_id, user, subscription
 
 @app.post(
     "/api/v1/auth/register",
@@ -594,7 +606,7 @@ async def get_quota_me(
     )
     refresh_subscription_state(subscription, user)
     await db.commit()
-    return _quota_response(subscription)
+    return _quota_response(subscription, user)
 
 
 @app.post(
@@ -1151,7 +1163,7 @@ async def scan_exterior(
     api_key: str = Depends(verify_api_key),
     accept_language: Optional[str] = Header(None, alias="Accept-Language"),
 ):
-    actor_user_id, subscription = await _check_scan_quota_for_request(
+    actor_user_id, actor_user, subscription = await _check_scan_quota_for_request(
         db,
         authorization=authorization,
         x_user_id=x_user_id,
@@ -1302,7 +1314,11 @@ async def scan_exterior(
     # Déduction du quota pour le scan d'IA (uniquement flux nominal, pas en cas d'idempotence)
     await decrement_quota(subscription.user_id, db)
     refreshed_subscription = await get_or_create_subscription(subscription.user_id, db)
-    if refreshed_subscription.tier == "free" and refreshed_subscription.remaining_tokens <= 1:
+    if (
+        not is_unlimited_scan_user(actor_user)
+        and refreshed_subscription.tier == "free"
+        and refreshed_subscription.remaining_tokens <= 1
+    ):
         await _create_notification(
             db,
             user_id=metadata.user_id,

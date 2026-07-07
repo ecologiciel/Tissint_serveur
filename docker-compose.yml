@@ -33,6 +33,7 @@ services:
       API_KEY: ${API_KEY:-meteorite_secret_prod_key_2026}
       STORAGE_DIR: /app/storage_vessel
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+      UNLIMITED_SCAN_EMAILS: ${UNLIMITED_SCAN_EMAILS:-user@tissint.ma}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-}
       PYTHONIOENCODING: utf-8

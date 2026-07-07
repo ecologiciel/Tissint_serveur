@@ -1,3 +1,4 @@
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -10,6 +11,8 @@ from exceptions import AppProductionException
 
 FREE_DAILY_SCAN_LIMIT = 5
 PREMIUM_DAILY_SCAN_LIMIT = 10
+UNLIMITED_SCAN_LIMIT = 999999
+DEFAULT_UNLIMITED_SCAN_EMAILS = "user@tissint.ma"
 PLAN_PRICES_DH = {
     "monthly": 100.0,
     "yearly": 960.0,
@@ -22,6 +25,20 @@ PLAN_DURATIONS = {
 
 def quota_limit_for_tier(tier: str) -> int:
     return PREMIUM_DAILY_SCAN_LIMIT if tier in {"premium", "admin"} else FREE_DAILY_SCAN_LIMIT
+
+def unlimited_scan_emails() -> set[str]:
+    raw = os.getenv("UNLIMITED_SCAN_EMAILS", DEFAULT_UNLIMITED_SCAN_EMAILS)
+    return {
+        email.strip().lower()
+        for email in raw.split(",")
+        if email.strip()
+    }
+
+def is_unlimited_scan_email(email: str | None) -> bool:
+    return bool(email and email.strip().lower() in unlimited_scan_emails())
+
+def is_unlimited_scan_user(user: UserModel | None) -> bool:
+    return is_unlimited_scan_email(user.email if user else None)
 
 def utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -255,7 +272,11 @@ async def check_scan_quota(user_id: str = Form(...), db: AsyncSession = Depends(
     Si le quota est epuise et qu'il n'est pas premium, leve une exception 402.
     """
     subscription = await get_or_create_subscription(user_id, db)
+    user = await db.get(UserModel, user_id)
     refresh_subscription_state(subscription)
+
+    if is_unlimited_scan_user(user):
+        return subscription
 
     if subscription.tier in {"premium", "admin"} and subscription_is_active(subscription):
         return subscription
@@ -276,6 +297,10 @@ async def decrement_quota(user_id: str, db: AsyncSession):
     """
     result = await db.execute(select(UserSubscription).where(UserSubscription.user_id == user_id))
     subscription = result.scalar_one_or_none()
+    user = await db.get(UserModel, user_id)
+
+    if is_unlimited_scan_user(user):
+        return
 
     if subscription and subscription.tier == "free" and subscription.remaining_tokens > 0:
         subscription.remaining_tokens -= 1
