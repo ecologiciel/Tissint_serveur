@@ -47,6 +47,46 @@ External smoke test after ports are open:
 curl http://72.62.236.197:8000/health
 ```
 
+## Durable HTTPS API
+
+For production, Vercel must call the backend through HTTPS:
+
+```text
+Vercel frontend -> Vercel proxy -> https://api.tissint.ma -> Hostinger backend -> Postgres
+```
+
+Before switching Vercel, create an A record:
+
+```text
+api.tissint.ma  A  72.62.236.197
+```
+
+Then run this from the Hostinger web terminal or SSH:
+
+```bash
+cd /opt/tissint/backend
+API_DOMAIN=api.tissint.ma PROXY_STACK=auto bash scripts/hostinger_enable_https_api.sh
+```
+
+The script refuses to continue if DNS is not pointing at the VPS or if local backend health fails. It uses Nginx when Nginx is already present; otherwise it installs Caddy for automatic TLS.
+
+After `https://api.tissint.ma/health` returns `database=ok`, update the Vercel production environment to:
+
+```text
+HOSTINGER_API_ORIGIN=https://api.tissint.ma
+HOSTINGER_API_KEY=<same value as backend API_KEY>
+```
+
+Remove `ALLOW_INSECURE_HOSTINGER_ORIGIN`, redeploy Vercel, and only then close public port `8000` in the Hostinger firewall. Keep `80` and `443` open.
+
+From the mobile app repository, the guarded Vercel switch is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\switch-vercel-hostinger-api.ps1 -Apply -Redeploy
+```
+
+The script checks `https://api.tissint.ma/health` before changing Vercel and then smokes the Vercel proxy.
+
 ## Mobile Configuration
 
 For a temporary IP-based test build:
