@@ -86,6 +86,7 @@ class ScanDecisionResponse(BaseModel):
     meteorite_probability: float
     dominant_class: str
     class_confidence: float
+    has_interior_cut: bool = False
     actions: ScanActions
     trigger_radar_admin: bool
     metadata_applied: ScanMetadataApplied
@@ -139,6 +140,7 @@ class MarketplaceListingResponse(BaseModel):
     class_confidence: float
     meteorite_probability: float
     fusion_score: float
+    has_interior_cut: bool = False
     price: float
     price_mode: str = "fixed_total"
     title: Optional[str] = None
@@ -166,6 +168,7 @@ class PublicListingItem(BaseModel):
     class_confidence: float
     meteorite_probability: float
     fusion_score: float
+    has_interior_cut: bool = False
     weight: Optional[float]
     weight_g: Optional[float] = None
     blurred_latitude: Optional[float]
@@ -199,6 +202,7 @@ class AdminRadarListingResponse(BaseModel):
     class_confidence: float
     meteorite_probability: float
     fusion_score: float
+    has_interior_cut: bool = False
     price: float
     price_mode: str = "fixed_total"
     title: Optional[str] = None
@@ -305,6 +309,7 @@ class CollectionItemResponse(BaseModel):
     status_code: Optional[str] = None
     is_meteorite: Optional[bool] = None
     class_confidence: Optional[float] = None
+    has_interior_cut: bool = False
     created_at: str
     main_image_uri: Optional[str] = None
     image_url: Optional[str] = None

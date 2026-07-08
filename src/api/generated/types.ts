@@ -21,6 +21,7 @@ export type AdminRadarListingResponse = {
   "class_confidence": number;
   "meteorite_probability": number;
   "fusion_score": number;
+  "has_interior_cut"?: boolean;
   "price": number;
   "price_mode"?: string;
   "title"?: string | null;
@@ -132,6 +133,7 @@ export type CollectionItemResponse = {
   "status_code"?: string | null;
   "is_meteorite"?: boolean | null;
   "class_confidence"?: number | null;
+  "has_interior_cut"?: boolean;
   "created_at": string;
   "main_image_uri"?: string | null;
   "image_url"?: string | null;
@@ -193,6 +195,7 @@ export type MarketplaceListingResponse = {
   "class_confidence": number;
   "meteorite_probability": number;
   "fusion_score": number;
+  "has_interior_cut"?: boolean;
   "price": number;
   "price_mode"?: string;
   "title"?: string | null;
@@ -286,6 +289,7 @@ export type PublicListingItem = {
   "class_confidence": number;
   "meteorite_probability": number;
   "fusion_score": number;
+  "has_interior_cut"?: boolean;
   "weight": number | null;
   "weight_g"?: number | null;
   "blurred_latitude": number | null;
@@ -379,6 +383,7 @@ export type ScanDecisionResponse = {
   "meteorite_probability": number;
   "dominant_class": string;
   "class_confidence": number;
+  "has_interior_cut"?: boolean;
   "actions": ScanActions;
   "trigger_radar_admin": boolean;
   "metadata_applied": ScanMetadataApplied;

@@ -5,6 +5,16 @@ HESITANT_THRESHOLD = 0.70
 SUCCESS_THRESHOLD = 0.8084
 UNKNOWN_CLASS = "Meteore_Unknown"
 RARE_CLASS_CONFIDENCE_THRESHOLD = 0.85
+INTERIOR_CUT_UNLOCK_THRESHOLD = 0.90
+NO_CUT_SCORE_FACTOR = 0.90
+NO_CUT_MAX_SCORE = 0.89
+
+
+def apply_interior_cut_score_policy(raw_score: float, has_interior_cut: bool = False) -> float:
+    score = float(raw_score)
+    if not has_interior_cut and score > INTERIOR_CUT_UNLOCK_THRESHOLD:
+        return min(score * NO_CUT_SCORE_FACTOR, NO_CUT_MAX_SCORE)
+    return score
 
 
 class BusinessOrchestrator:
@@ -49,9 +59,9 @@ class BusinessOrchestrator:
             if resolved_language == "fr":
                 class_part = f" et la classe la plus probable est {dominant_class}" if show_subclass else ""
                 cut_part = (
-                    "La photo de coupe intérieure fournie a été prise en compte dans cette analyse."
+                    "Photo de coupe prise en compte : dossier renforcé, badge supérieur et visibilité marché améliorée."
                     if has_interior_cut
-                    else "Une photo de coupe intérieure renforcera la classification et pourra améliorer sa valeur."
+                    else "Ajoutez une photo de coupe pour débloquer le niveau supérieur : badge renforcé, meilleure visibilité sur le marché et dossier plus crédible pour les acheteurs/experts."
                 )
                 body = (
                     f"Félicitations, candidat très prometteur. Le score d'analyse est de {score}%"
@@ -60,9 +70,9 @@ class BusinessOrchestrator:
             else:
                 class_part = f" والفئة الأقرب هي {dominant_class}" if show_subclass else ""
                 cut_part = (
-                    "تم احتساب صورة القطع الداخلي المرفقة في هذا التحليل."
+                    "تم احتساب صورة القطع الداخلي: ملف أقوى، شارة أعلى، وظهور محسّن في السوق."
                     if has_interior_cut
-                    else "إضافة صورة لقطع داخلي ستقوي التصنيف وقد ترفع من قيمتها."
+                    else "أضف صورة للقطع الداخلي لفتح المستوى الأعلى: شارة أقوى، ظهور أفضل في السوق، وملف أكثر مصداقية لدى المشترين والخبراء."
                 )
                 body = (
                     f"تهانينا، هذا مرشح واعد جدا. نتيجة التحليل هي {score}%"
@@ -74,9 +84,9 @@ class BusinessOrchestrator:
             if resolved_language == "fr":
                 class_part = f" et la classe la plus probable est {dominant_class}" if show_subclass else ""
                 cut_part = (
-                    "La photo de coupe intérieure fournie a été prise en compte, mais le résultat reste à confirmer."
+                    "Photo de coupe prise en compte : dossier renforcé, badge supérieur et visibilité marché améliorée."
                     if has_interior_cut
-                    else "Une photo de coupe intérieure est indispensable pour trancher."
+                    else "Ajoutez une photo de coupe pour débloquer le niveau supérieur : badge renforcé, meilleure visibilité sur le marché et dossier plus crédible pour les acheteurs/experts."
                 )
                 body = (
                     f"Félicitations avec prudence. Le score d'analyse est de {score}%"
@@ -85,9 +95,9 @@ class BusinessOrchestrator:
             else:
                 class_part = f" والفئة الأقرب هي {dominant_class}" if show_subclass else ""
                 cut_part = (
-                    "تم احتساب صورة القطع الداخلي المرفقة، لكن النتيجة ما زالت تحتاج إلى تأكيد."
+                    "تم احتساب صورة القطع الداخلي: ملف أقوى، شارة أعلى، وظهور محسّن في السوق."
                     if has_interior_cut
-                    else "صورة لقطع داخلي ضرورية جدا للحسم."
+                    else "أضف صورة للقطع الداخلي لفتح المستوى الأعلى: شارة أقوى، ظهور أفضل في السوق، وملف أكثر مصداقية لدى المشترين والخبراء."
                 )
                 body = (
                     f"تهانينا بحذر. نتيجة التحليل هي {score}%"
@@ -121,7 +131,10 @@ class BusinessOrchestrator:
         language: Optional[str] = None,
         has_interior_cut: bool = False,
     ) -> Dict[str, Any]:
-        prob = fusion_output["meteorite_probability"]
+        prob = apply_interior_cut_score_policy(
+            fusion_output["meteorite_probability"],
+            has_interior_cut=has_interior_cut,
+        )
         dominant_class = fusion_output["dominant_class"]
         confidence = fusion_output["class_confidence"]
         is_meteorite = bool(fusion_output["is_meteorite"] and prob >= self.hesitant_threshold)
@@ -146,6 +159,7 @@ class BusinessOrchestrator:
             "meteorite_probability": prob,
             "dominant_class": dominant_class,
             "class_confidence": confidence,
+            "has_interior_cut": bool(has_interior_cut),
             "actions": actions,
             "trigger_radar_admin": radar_admin,
             "metadata_applied": fusion_output.get("metadata_applied", {}),

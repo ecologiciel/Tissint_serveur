@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,7 +13,12 @@ os.environ.setdefault(
 )
 os.environ.setdefault("STORAGE_DIR", os.getenv("TEST_STORAGE_DIR", ".runtime/test-storage"))
 
-from business_logic import BusinessOrchestrator, HESITANT_THRESHOLD, SUCCESS_THRESHOLD
+from business_logic import (
+    BusinessOrchestrator,
+    HESITANT_THRESHOLD,
+    SUCCESS_THRESHOLD,
+    apply_interior_cut_score_policy,
+)
 from billing import PREMIUM_DAILY_SCAN_LIMIT, UNLIMITED_SCAN_LIMIT
 from database import AsyncSessionLocal, CollectionItemModel, ListingModel, ScanModel, UserModel, UserSubscription
 from fusion_engine import MeteoriteFusionEngine
@@ -238,6 +244,80 @@ async def seed_publishable_scan_without_weight(user_id: str) -> str:
     return scan_id
 
 
+async def seed_marketplace_priority_pair(user_id: str, marker: str) -> tuple[str, str]:
+    boosted_scan_id = f"scan-{unique_suffix()}"
+    plain_scan_id = f"scan-{unique_suffix()}"
+    boosted_listing_id = f"listing-{unique_suffix()}"
+    plain_listing_id = f"listing-{unique_suffix()}"
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    async with AsyncSessionLocal() as db:
+        db.add(
+            ScanModel(
+                id=boosted_scan_id,
+                client_uuid=f"priority-boosted-{unique_suffix()}",
+                user_id=user_id,
+                status_code="DIAGNOSTIC_SUCCESS_HIGH",
+                is_meteorite=True,
+                meteorite_probability=0.96,
+                dominant_class="Chondrite",
+                class_confidence=0.86,
+                weight=44.0,
+                magnetic=True,
+                latitude=31.6,
+                longitude=-7.9,
+                raw_vision_outputs={"exterior": {}, "interior": {}},
+                exterior_images_paths=["storage/test/boosted.jpg"],
+                interior_image_path="storage/test/boosted-cut.jpg",
+            )
+        )
+        db.add(
+            ScanModel(
+                id=plain_scan_id,
+                client_uuid=f"priority-plain-{unique_suffix()}",
+                user_id=user_id,
+                status_code="DIAGNOSTIC_SUCCESS_HIGH",
+                is_meteorite=True,
+                meteorite_probability=0.89,
+                dominant_class="Chondrite",
+                class_confidence=0.86,
+                weight=44.0,
+                magnetic=True,
+                latitude=31.6,
+                longitude=-7.9,
+                raw_vision_outputs={"exterior": {}},
+                exterior_images_paths=["storage/test/plain.jpg"],
+            )
+        )
+        db.add(
+            ListingModel(
+                id=boosted_listing_id,
+                scan_id=boosted_scan_id,
+                price=1000.0,
+                status="published",
+                title=f"{marker} boosted",
+                description="Older reinforced dossier.",
+                price_mode="fixed_total",
+                region="Tissint",
+                created_at=now - timedelta(days=1),
+            )
+        )
+        db.add(
+            ListingModel(
+                id=plain_listing_id,
+                scan_id=plain_scan_id,
+                price=1000.0,
+                status="published",
+                title=f"{marker} plain",
+                description="Newer dossier without cut.",
+                price_mode="fixed_total",
+                region="Tissint",
+                created_at=now,
+            )
+        )
+        await db.commit()
+    return boosted_listing_id, plain_listing_id
+
+
 async def load_scan_raw_vision(scan_id: str) -> dict:
     async with AsyncSessionLocal() as db:
         scan = await db.get(ScanModel, scan_id)
@@ -250,6 +330,34 @@ async def load_scan_weight(scan_id: str) -> float | None:
         scan = await db.get(ScanModel, scan_id)
         assert scan is not None
         return scan.weight
+
+
+async def load_scan_score(scan_id: str) -> float:
+    async with AsyncSessionLocal() as db:
+        scan = await db.get(ScanModel, scan_id)
+        assert scan is not None
+        return scan.meteorite_probability
+
+
+def high_confidence_vision_results(include_interior: bool = False) -> dict:
+    model_output = {
+        "prob_bin": 0.98,
+        "prob_sub": [0.01, 0.02, 0.01, 0.86, 0.02, 0.08],
+    }
+    result = {
+        "exterior": {
+            "dino": model_output,
+            "swin": model_output,
+            "convnext": model_output,
+        }
+    }
+    if include_interior:
+        result["interior"] = {
+            "dino": model_output,
+            "swin": model_output,
+            "convnext": model_output,
+        }
+    return result
 
 
 def test_scan_diagnostic_messages_are_deterministic():
@@ -335,6 +443,46 @@ def test_scan_diagnostic_messages_are_deterministic():
     assert rejected["message"]["language"] == "ar"
     assert rejected["message"]["tone"] == "neutral"
     assert "12.3%" in rejected["message"]["body"]
+
+
+def test_high_score_requires_interior_cut_to_reach_90_plus():
+    orchestrator = BusinessOrchestrator()
+
+    assert apply_interior_cut_score_policy(0.98, has_interior_cut=False) == pytest.approx(0.882)
+    assert apply_interior_cut_score_policy(0.98, has_interior_cut=True) == pytest.approx(0.98)
+    assert apply_interior_cut_score_policy(0.89, has_interior_cut=False) == pytest.approx(0.89)
+
+    without_cut = orchestrator.evaluate_decision(
+        {
+            "is_meteorite": True,
+            "meteorite_probability": 0.98,
+            "dominant_class": "Chondrite",
+            "class_confidence": 0.86,
+            "metadata_applied": {},
+        },
+        language="fr-FR",
+        has_interior_cut=False,
+    )
+    assert without_cut["meteorite_probability"] == pytest.approx(0.882)
+    assert without_cut["has_interior_cut"] is False
+    assert without_cut["actions"]["invite_interior_cut"] is True
+    assert "niveau supérieur" in without_cut["message"]["body"]
+
+    with_cut = orchestrator.evaluate_decision(
+        {
+            "is_meteorite": True,
+            "meteorite_probability": 0.98,
+            "dominant_class": "Chondrite",
+            "class_confidence": 0.86,
+            "metadata_applied": {},
+        },
+        language="fr-FR",
+        has_interior_cut=True,
+    )
+    assert with_cut["meteorite_probability"] == pytest.approx(0.98)
+    assert with_cut["has_interior_cut"] is True
+    assert with_cut["actions"]["invite_interior_cut"] is False
+    assert "dossier renforcé" in with_cut["message"]["body"]
 
 
 def test_fusion_engine_uses_hesitant_threshold_for_binary_verdict():
@@ -610,6 +758,84 @@ def test_scan_idempotent_response_includes_localized_message(client: TestClient)
     assert "marketplace" in payload["message"]["body"]
 
 
+def test_scan_exterior_without_cut_adjusts_high_score_and_notifications(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeVisionPipeline:
+        def process_full_scan(self, list_exterior_bytes: list[bytes], interior_bytes: bytes | None = None) -> dict:
+            assert len(list_exterior_bytes) == 3
+            assert interior_bytes is None
+            return high_confidence_vision_results()
+
+    monkeypatch.setattr(main_module, "vision_pipeline", FakeVisionPipeline())
+    session = register_user(client, "score-no-cut")
+    user_id = session["user"]["id"]
+
+    response = client.post(
+        "/api/v1/scan/exterior",
+        headers={**api_headers(session["access_token"]), "Accept-Language": "fr-FR"},
+        data={"client_uuid": f"score-no-cut-{unique_suffix()}", "user_id": user_id},
+        files=[
+            ("files_exterior", ("one.jpg", b"jpeg-one", "image/jpeg")),
+            ("files_exterior", ("two.jpg", b"jpeg-two", "image/jpeg")),
+            ("files_exterior", ("three.jpg", b"jpeg-three", "image/jpeg")),
+        ],
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["meteorite_probability"] == pytest.approx(0.882)
+    assert payload["meteorite_probability"] < 0.90
+    assert payload["has_interior_cut"] is False
+    assert payload["actions"]["invite_interior_cut"] is True
+    assert "niveau supérieur" in payload["message"]["body"]
+    assert run_in_app_loop(client, load_scan_score, payload["scan_id"]) == pytest.approx(0.882)
+
+    notifications = client.get("/api/v1/notifications", headers=api_headers(session["access_token"]))
+    assert notifications.status_code == 200, notifications.text
+    assert any(
+        item["type"] == "scan_ready" and "88.2/100" in item["body"]
+        for item in notifications.json()
+    )
+
+
+def test_scan_exterior_with_initial_cut_unlocks_90_plus_score(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeVisionPipeline:
+        def process_full_scan(self, list_exterior_bytes: list[bytes], interior_bytes: bytes | None = None) -> dict:
+            assert len(list_exterior_bytes) == 3
+            assert interior_bytes == b"cut-photo"
+            return high_confidence_vision_results(include_interior=True)
+
+    monkeypatch.setattr(main_module, "vision_pipeline", FakeVisionPipeline())
+    session = register_user(client, "score-with-cut")
+    user_id = session["user"]["id"]
+
+    response = client.post(
+        "/api/v1/scan/exterior",
+        headers={**api_headers(session["access_token"]), "Accept-Language": "fr-FR"},
+        data={"client_uuid": f"score-with-cut-{unique_suffix()}", "user_id": user_id},
+        files=[
+            ("files_exterior", ("one.jpg", b"jpeg-one", "image/jpeg")),
+            ("files_exterior", ("two.jpg", b"jpeg-two", "image/jpeg")),
+            ("files_exterior", ("three.jpg", b"jpeg-three", "image/jpeg")),
+            ("file_interior", ("cut.jpg", b"cut-photo", "image/jpeg")),
+        ],
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["meteorite_probability"] == pytest.approx(0.98)
+    assert payload["meteorite_probability"] > 0.90
+    assert payload["has_interior_cut"] is True
+    assert payload["actions"]["invite_interior_cut"] is False
+    assert "dossier renforcé" in payload["message"]["body"]
+    assert run_in_app_loop(client, load_scan_score, payload["scan_id"]) == pytest.approx(0.98)
+
+
 def test_scan_exterior_with_initial_interior_cut_suppresses_cut_invite(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -652,6 +878,7 @@ def test_scan_exterior_with_initial_interior_cut_suppresses_cut_invite(
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["status_code"] == "DIAGNOSTIC_HESITANT"
+    assert payload["has_interior_cut"] is True
     assert payload["actions"]["invite_interior_cut"] is False
     assert "prise en compte" in payload["message"]["body"]
     assert "indispensable" not in payload["message"]["body"]
@@ -696,6 +923,7 @@ def test_scan_interior_update_persists_raw_vision_outputs(client: TestClient, mo
     payload = response.json()
     assert payload["scan_id"] == scan_id
     assert payload["dominant_class"] == "Meteore_Unknown"
+    assert payload["has_interior_cut"] is True
     assert payload["actions"]["invite_interior_cut"] is False
     assert "Meteore_Unknown" not in payload["message"]["body"]
     assert "prise en compte" in payload["message"]["body"]
@@ -805,6 +1033,7 @@ def test_marketplace_publish_persists_required_vendor_data_and_public_contract(c
     assert published["description"] == "Fragment verifie avec coupe interieure disponible."
     assert published["meteorite_probability"] == 0.88
     assert published["fusion_score"] == 0.88
+    assert published["has_interior_cut"] is True
     assert published["class_confidence"] == 0.74
     assert published["confidence"] == 0.74
     assert published["interior_image_uri"].startswith("/storage/")
@@ -819,6 +1048,7 @@ def test_marketplace_publish_persists_required_vendor_data_and_public_contract(c
     assert listing["weight_g"] == 31.5
     assert listing["meteorite_probability"] == 0.88
     assert listing["fusion_score"] == 0.88
+    assert listing["has_interior_cut"] is True
     assert listing["class_confidence"] == 0.74
     assert listing["can_contact"] is False
     assert listing["contact_lock_reason"] == "premium_required"
@@ -832,7 +1062,36 @@ def test_marketplace_publish_persists_required_vendor_data_and_public_contract(c
     assert detail["region"] == "Tata"
     assert detail["price"] == 4300.0
     assert detail["description"] == "Fragment verifie avec coupe interieure disponible."
+    assert detail["has_interior_cut"] is True
     assert detail["gallery_images"] == listing["gallery_images"]
+
+
+def test_marketplace_prioritizes_reinforced_90_plus_dossiers(client: TestClient):
+    seller_session = register_user(client, "priority")
+    marker = f"priority-{unique_suffix()}"
+    boosted_listing_id, plain_listing_id = run_in_app_loop(
+        client,
+        seed_marketplace_priority_pair,
+        seller_session["user"]["id"],
+        marker,
+    )
+
+    response = client.post(
+        "/api/v1/marketplace/search",
+        headers=api_headers(),
+        json={"query": marker},
+    )
+
+    assert response.status_code == 200, response.text
+    results = response.json()
+    result_ids = [item["listing_id"] for item in results]
+    assert result_ids[:2] == [boosted_listing_id, plain_listing_id]
+    boosted = results[0]
+    plain = results[1]
+    assert boosted["has_interior_cut"] is True
+    assert boosted["meteorite_probability"] == pytest.approx(0.96)
+    assert plain["has_interior_cut"] is False
+    assert plain["meteorite_probability"] == pytest.approx(0.89)
 
 
 def test_marketplace_publish_rejects_missing_required_vendor_data(client: TestClient):
@@ -1014,6 +1273,7 @@ def test_ui_alignment_collection_and_marketplace_images(client: TestClient):
     assert listing["main_image_uri"].startswith("/storage/")
     assert listing["image_url"] == listing["main_image_uri"]
     assert listing["thumbnail_uri"] == listing["main_image_uri"]
+    assert listing["has_interior_cut"] is False
     assert listing["can_contact"] is False
     assert listing["seller_phone"] is None
     assert listing["seller_whatsapp"] is None
@@ -1033,6 +1293,7 @@ def test_ui_alignment_collection_and_marketplace_images(client: TestClient):
     assert collection_item["main_image_uri"].startswith("/storage/")
     assert collection_item["image_url"] == collection_item["main_image_uri"]
     assert collection_item["thumbnail_uri"] == collection_item["main_image_uri"]
+    assert collection_item["has_interior_cut"] is False
     assert collection_item["weight_g"] == 18.4
     assert collection_item["region"] == "Tissint"
     assert collection_item["notes"] == "Admin radar candidate without public contact data."

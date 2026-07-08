@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import or_, text
+from sqlalchemy import case, or_, text
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -98,7 +98,13 @@ if SKIP_MODEL_LOAD:
 else:
     from pipeline_vision import VisionPipeline
 from fusion_engine import MeteoriteFusionEngine
-from business_logic import BusinessOrchestrator
+from business_logic import (
+    BusinessOrchestrator,
+    INTERIOR_CUT_UNLOCK_THRESHOLD,
+    NO_CUT_MAX_SCORE,
+    NO_CUT_SCORE_FACTOR,
+    apply_interior_cut_score_policy,
+)
 
 # Import database and storage components
 from database import (
@@ -148,6 +154,12 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("UPDATE user_subscriptions SET status = CASE WHEN tier IN ('premium', 'admin') THEN 'active' ELSE 'none' END WHERE status IS NULL"))
         await conn.execute(text("UPDATE user_subscriptions SET cancel_at_period_end = FALSE WHERE cancel_at_period_end IS NULL"))
         await conn.execute(text("UPDATE user_subscriptions SET updated_at = NOW() WHERE updated_at IS NULL"))
+        await conn.execute(text(
+            "UPDATE scans "
+            f"SET meteorite_probability = LEAST(meteorite_probability * {NO_CUT_SCORE_FACTOR}, {NO_CUT_MAX_SCORE}) "
+            "WHERE interior_image_path IS NULL "
+            f"AND meteorite_probability > {INTERIOR_CUT_UNLOCK_THRESHOLD}"
+        ))
     yield
 
 app = FastAPI(
@@ -904,6 +916,15 @@ def _scan_thumbnail_uri(scan: ScanModel) -> Optional[str]:
 def _scan_interior_image_uri(scan: ScanModel) -> Optional[str]:
     return storage_provider.public_url(scan.interior_image_path)
 
+def _scan_has_interior_cut(scan: ScanModel) -> bool:
+    return bool(scan.interior_image_path)
+
+def _scan_user_score(scan: ScanModel) -> float:
+    return apply_interior_cut_score_policy(
+        scan.meteorite_probability,
+        has_interior_cut=_scan_has_interior_cut(scan),
+    )
+
 def _listing_image_fields(scan: ScanModel) -> dict:
     main_image_uri = _scan_main_image_uri(scan)
     gallery_images: list[str] = []
@@ -921,6 +942,17 @@ def _listing_image_fields(scan: ScanModel) -> dict:
         "interior_image_uri": interior_image_uri,
         "gallery_images": gallery_images,
     }
+
+def _marketplace_priority_ordering():
+    premium_case = case(
+        (
+            (ScanModel.interior_image_path.isnot(None))
+            & (ScanModel.meteorite_probability > INTERIOR_CUT_UNLOCK_THRESHOLD),
+            1,
+        ),
+        else_=0,
+    )
+    return premium_case.desc(), ListingModel.created_at.desc()
 
 async def _create_notification(
     db: AsyncSession,
@@ -1103,6 +1135,8 @@ def _admin_radar_listing_response(
 ) -> AdminRadarListingResponse:
     hold_until = _listing_hold_until(listing)
     image_fields = _listing_image_fields(scan)
+    has_interior_cut = _scan_has_interior_cut(scan)
+    score = _scan_user_score(scan)
     return AdminRadarListingResponse(
         listing_id=listing.id,
         scan_id=scan.id,
@@ -1110,8 +1144,9 @@ def _admin_radar_listing_response(
         dominant_class=scan.dominant_class,
         confidence=scan.class_confidence,
         class_confidence=scan.class_confidence,
-        meteorite_probability=scan.meteorite_probability,
-        fusion_score=scan.meteorite_probability,
+        meteorite_probability=score,
+        fusion_score=score,
+        has_interior_cut=has_interior_cut,
         price=listing.price,
         price_mode=_listing_price_mode(listing),
         title=listing.title or scan.dominant_class,
@@ -1145,6 +1180,8 @@ def _public_listing_item(
     contact_locked_until = _listing_hold_until(listing)
     seller_phone = seller.phone if seller and can_contact else None
     image_fields = _listing_image_fields(scan)
+    has_interior_cut = _scan_has_interior_cut(scan)
+    score = _scan_user_score(scan)
     return PublicListingItem(
         listing_id=listing.id,
         scan_id=scan.id,
@@ -1153,8 +1190,9 @@ def _public_listing_item(
         dominant_class=scan.dominant_class,
         confidence=scan.class_confidence,
         class_confidence=scan.class_confidence,
-        meteorite_probability=scan.meteorite_probability,
-        fusion_score=scan.meteorite_probability,
+        meteorite_probability=score,
+        fusion_score=score,
+        has_interior_cut=has_interior_cut,
         weight=scan.weight,
         weight_g=scan.weight,
         blurred_latitude=safe_lat,
@@ -1200,16 +1238,19 @@ def _collection_item_response(
     if collection.status != status_value:
         collection.status = status_value
     image_fields = _listing_image_fields(scan)
+    has_interior_cut = _scan_has_interior_cut(scan)
+    score = _scan_user_score(scan)
 
     return CollectionItemResponse(
         id=collection.id,
         scan_id=scan.id,
         class_name=scan.dominant_class,
-        fusion_score=scan.meteorite_probability,
+        fusion_score=score,
         status=status_value,
         status_code=scan.status_code,
         is_meteorite=scan.is_meteorite,
         class_confidence=scan.class_confidence,
+        has_interior_cut=has_interior_cut,
         created_at=collection.created_at.isoformat() if collection.created_at else "",
         weight_g=scan.weight,
         magnetic=scan.magnetic,
@@ -1217,7 +1258,7 @@ def _collection_item_response(
         longitude=scan.longitude,
         region=listing.region if listing else None,
         notes=listing.description if listing else None,
-        meteorite_probability=scan.meteorite_probability,
+        meteorite_probability=score,
         **image_fields,
     )
 
@@ -1279,6 +1320,7 @@ async def scan_exterior(
             raise AppProductionException("FORBIDDEN", "Identifiant utilisateur divergent.", 403)
         print(f"🔄 [Idempotence] Scan existant récupéré pour client_uuid: {metadata.client_uuid}")
         has_interior_cut = bool(existing_scan.interior_image_path)
+        displayed_score = _scan_user_score(existing_scan)
         actions = business_orchestrator.build_scan_actions(
             existing_scan.status_code,
             has_interior_cut=has_interior_cut,
@@ -1292,7 +1334,7 @@ async def scan_exterior(
                 "is_sync_retry": True,
                 "client_platform": _detect_client_platform(user_agent),
                 "status_code": existing_scan.status_code,
-                "meteorite_probability": _round_score(existing_scan.meteorite_probability),
+                "meteorite_probability": _round_score(displayed_score),
                 "dominant_class": existing_scan.dominant_class,
                 "class_confidence": _round_score(existing_scan.class_confidence),
                 "metadata": {
@@ -1306,9 +1348,10 @@ async def scan_exterior(
         return {
             "status_code": existing_scan.status_code,
             "is_meteorite": existing_scan.is_meteorite,
-            "meteorite_probability": existing_scan.meteorite_probability,
+            "meteorite_probability": displayed_score,
             "dominant_class": existing_scan.dominant_class,
             "class_confidence": existing_scan.class_confidence,
+            "has_interior_cut": has_interior_cut,
             "actions": actions,
             "trigger_radar_admin": False,
             "metadata_applied": {
@@ -1319,7 +1362,7 @@ async def scan_exterior(
             "message": business_orchestrator.build_message(
                 status_code=existing_scan.status_code,
                 dominant_class=existing_scan.dominant_class,
-                meteorite_probability=existing_scan.meteorite_probability,
+                meteorite_probability=displayed_score,
                 actions=actions,
                 language=accept_language,
                 has_interior_cut=has_interior_cut,
@@ -1871,6 +1914,8 @@ async def publish_to_marketplace(
     safe_lat, safe_lon = _blur_coordinates(scan)
     contact_locked_until = _listing_hold_until(listing)
     image_fields = _listing_image_fields(scan)
+    has_interior_cut = _scan_has_interior_cut(scan)
+    score = _scan_user_score(scan)
 
     return MarketplaceListingResponse(
         status=listing.status,
@@ -1881,8 +1926,9 @@ async def publish_to_marketplace(
         dominant_class=dominant_class,
         confidence=confidence,
         class_confidence=confidence,
-        meteorite_probability=scan.meteorite_probability,
-        fusion_score=scan.meteorite_probability,
+        meteorite_probability=score,
+        fusion_score=score,
+        has_interior_cut=has_interior_cut,
         price=listing.price,
         price_mode=_listing_price_mode(listing),
         title=listing.title,
@@ -1926,7 +1972,7 @@ async def get_marketplace_listings(
                 list(MARKETPLACE_VISIBLE_STATUSES | {"available", "reserved"})
             )
         )
-        .order_by(ListingModel.created_at.desc())
+        .order_by(*_marketplace_priority_ordering())
     )
     result = await db.execute(query)
     rows = result.all()
@@ -2816,7 +2862,7 @@ async def get_seller_profile(
         .join(ScanModel, ListingModel.scan_id == ScanModel.id)
         .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
         .where(ScanModel.user_id == seller.id, ListingModel.status.in_(list(MARKETPLACE_VISIBLE_STATUSES)))
-        .order_by(ListingModel.created_at.desc())
+        .order_by(*_marketplace_priority_ordering())
     )
     listings = [
         _public_listing_item(listing, scan, listing_seller, viewer_role)
@@ -2939,7 +2985,7 @@ async def get_my_marketplace_listings(
         .join(ScanModel, ListingModel.scan_id == ScanModel.id)
         .outerjoin(UserModel, UserModel.id == ScanModel.user_id)
         .where(ScanModel.user_id == user.id)
-        .order_by(ListingModel.created_at.desc())
+        .order_by(*_marketplace_priority_ordering())
     )
     return [_public_listing_item(listing, scan, seller, subscription.tier) for listing, scan, seller in result.all()]
 
@@ -2982,7 +3028,7 @@ async def search_marketplace(
     if payload.price_max is not None:
         query = query.where(ListingModel.price <= payload.price_max)
 
-    result = await db.execute(query.order_by(ListingModel.created_at.desc()))
+    result = await db.execute(query.order_by(*_marketplace_priority_ordering()))
     return [
         _public_listing_item(listing, scan, seller, viewer_role)
         for listing, scan, seller in result.all()
