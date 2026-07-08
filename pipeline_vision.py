@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import io
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any
@@ -16,6 +16,7 @@ class VisionPipeline:
     def __init__(self):
         self.device = torch.device("cpu")
         self.num_classes = 6  # ['None', 'Achondrite', 'Carbonee', 'Chondrite', 'Metallique', 'Meteore_Unknown']
+        self.classes = ['None', 'Achondrite', 'Carbonee', 'Chondrite', 'Metallique', 'Meteore_Unknown']
         print("🤖 Initialisation et chargement des 3 modèles sur CPU...")
         
         # 1. Chargement DINOv2
@@ -44,7 +45,7 @@ class VisionPipeline:
 
     def _preprocess_image(self, image_bytes: bytes) -> torch.Tensor:
         """Convertit les octets bruts d'une image en tenseur prêt pour le modèle."""
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
         return self.transform(image).unsqueeze(0).to(self.device)
 
     def _predict_single_model(self, model_name: str, tensor: torch.Tensor) -> Dict[str, Any]:
@@ -78,6 +79,33 @@ class VisionPipeline:
                 
         return results
 
+    def _summarize_image_predictions(self, image_index: int, predictions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        model_bins = []
+        model_subs = []
+        model_summaries = {}
+
+        for model_name, result in predictions.items():
+            prob_sub = result.get("prob_sub") or []
+            top_idx = int(np.argmax(prob_sub)) if prob_sub else None
+            model_bins.append(result["prob_bin"])
+            model_subs.append(prob_sub)
+            model_summaries[model_name] = {
+                "prob_bin": float(result["prob_bin"]),
+                "top_class": self.classes[top_idx] if top_idx is not None and top_idx < len(self.classes) else None,
+                "top_prob": float(prob_sub[top_idx]) if top_idx is not None else None,
+            }
+
+        combined_sub = np.mean(model_subs, axis=0).astype(float) if model_subs else np.array([])
+        top_idx = int(np.argmax(combined_sub)) if combined_sub.size else None
+
+        return {
+            "index": image_index,
+            "prob_bin": float(np.mean(model_bins)) if model_bins else None,
+            "top_class": self.classes[top_idx] if top_idx is not None and top_idx < len(self.classes) else None,
+            "top_prob": float(combined_sub[top_idx]) if top_idx is not None else None,
+            "models": model_summaries,
+        }
+
     def process_full_scan(self, list_exterior_bytes: List[bytes], interior_bytes: Optional[bytes] = None) -> Dict[str, Any]:
         """
         Traite l'ensemble du lot de photos (Multi-angles extérieures + Coupe intérieure optionnelle).
@@ -86,9 +114,11 @@ class VisionPipeline:
         # 1. Analyse du lot extérieur
         ext_dino_bin, ext_swin_bin, ext_conv_bin = [], [], []
         ext_dino_sub, ext_swin_sub, ext_conv_sub = [], [], []
+        exterior_per_image = []
         
-        for img_bytes in list_exterior_bytes:
+        for image_index, img_bytes in enumerate(list_exterior_bytes):
             res = self.predict_image_parallel(img_bytes)
+            exterior_per_image.append(self._summarize_image_predictions(image_index, res))
             
             ext_dino_bin.append(res["dino"]["prob_bin"])
             ext_dino_sub.append(res["dino"]["prob_sub"])
@@ -115,6 +145,7 @@ class VisionPipeline:
                     "prob_sub": np.mean(ext_conv_sub, axis=0).astype(float).tolist()
                 }
             },
+            "exterior_per_image": exterior_per_image,
             "interior": None
         }
         

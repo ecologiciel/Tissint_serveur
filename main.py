@@ -7,6 +7,7 @@ import os
 import re
 import hashlib
 import json
+import io
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
+from PIL import Image
 
 from exceptions import (
     AppProductionException,
@@ -194,6 +196,92 @@ ERROR_RESPONSES = {
 vision_pipeline = None if SKIP_MODEL_LOAD else VisionPipeline()
 fusion_engine = MeteoriteFusionEngine()
 business_orchestrator = BusinessOrchestrator()
+METEORITE_CLASSES = ["None", "Achondrite", "Carbonee", "Chondrite", "Metallique", "Meteore_Unknown"]
+
+
+def _round_score(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), 6)
+
+
+def _detect_client_platform(user_agent: Optional[str]) -> str:
+    ua = (user_agent or "").lower()
+    if "android" in ua:
+        return "android"
+    if "iphone" in ua or "ipad" in ua or "ios" in ua:
+        return "ios"
+    if "mobile" in ua:
+        return "mobile_web"
+    if ua:
+        return "desktop_web"
+    return "unknown"
+
+
+def _upload_file_summary(file: UploadFile, data: bytes, index: int) -> dict:
+    width = None
+    height = None
+    exif_orientation = None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+            exif_orientation = image.getexif().get(274)
+    except Exception:
+        pass
+
+    return {
+        "index": index,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size_bytes": len(data),
+        "width": width,
+        "height": height,
+        "exif_orientation": exif_orientation,
+        "sha256_16": hashlib.sha256(data).hexdigest()[:16],
+    }
+
+
+def _vision_output_summary(vision_outputs: dict) -> dict:
+    summary = {}
+    for area_name in ("exterior", "interior"):
+        area = vision_outputs.get(area_name)
+        if not area:
+            summary[area_name] = None
+            continue
+        area_summary = {}
+        for model_name, model_output in area.items():
+            prob_sub = model_output.get("prob_sub") or []
+            top_idx = max(range(len(prob_sub)), key=lambda i: prob_sub[i]) if prob_sub else None
+            area_summary[model_name] = {
+                "prob_bin": _round_score(model_output.get("prob_bin")),
+                "top_class": METEORITE_CLASSES[top_idx] if top_idx is not None and top_idx < len(METEORITE_CLASSES) else None,
+                "top_prob": _round_score(prob_sub[top_idx]) if top_idx is not None else None,
+            }
+        summary[area_name] = area_summary
+
+    exterior_per_image = []
+    for image_summary in vision_outputs.get("exterior_per_image") or []:
+        model_summaries = {}
+        for model_name, model_output in (image_summary.get("models") or {}).items():
+            model_summaries[model_name] = {
+                "prob_bin": _round_score(model_output.get("prob_bin")),
+                "top_class": model_output.get("top_class"),
+                "top_prob": _round_score(model_output.get("top_prob")),
+            }
+        exterior_per_image.append({
+            "index": image_summary.get("index"),
+            "prob_bin": _round_score(image_summary.get("prob_bin")),
+            "top_class": image_summary.get("top_class"),
+            "top_prob": _round_score(image_summary.get("top_prob")),
+            "models": model_summaries,
+        })
+    if exterior_per_image:
+        summary["exterior_per_image"] = exterior_per_image
+    return summary
+
+
+def _print_scan_event(event: str, payload: dict) -> None:
+    print(f"[{event}] {json.dumps(payload, ensure_ascii=True, sort_keys=True)}")
 
 @app.get(
     "/health",
@@ -1159,6 +1247,7 @@ async def scan_exterior(
     longitude: Optional[float] = Form(None),
     authorization: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
     accept_language: Optional[str] = Header(None, alias="Accept-Language"),
@@ -1193,6 +1282,26 @@ async def scan_exterior(
         actions = business_orchestrator.build_scan_actions(
             existing_scan.status_code,
             has_interior_cut=has_interior_cut,
+        )
+        _print_scan_event(
+            "ScanResult",
+            {
+                "client_uuid": metadata.client_uuid,
+                "scan_id": existing_scan.id,
+                "user_id": metadata.user_id,
+                "is_sync_retry": True,
+                "client_platform": _detect_client_platform(user_agent),
+                "status_code": existing_scan.status_code,
+                "meteorite_probability": _round_score(existing_scan.meteorite_probability),
+                "dominant_class": existing_scan.dominant_class,
+                "class_confidence": _round_score(existing_scan.class_confidence),
+                "metadata": {
+                    "weight": existing_scan.weight,
+                    "magnetic": existing_scan.magnetic,
+                    "latitude_provided": existing_scan.latitude is not None,
+                    "longitude_provided": existing_scan.longitude is not None,
+                },
+            },
         )
         return {
             "status_code": existing_scan.status_code,
@@ -1231,23 +1340,47 @@ async def scan_exterior(
     # 1. Extraction et Sauvegarde Asynchrone des images extérieures
     list_exterior_bytes = []
     exterior_paths = []
-    for f in files_exterior:
+    exterior_file_summaries = []
+    for index, f in enumerate(files_exterior):
         await validate_upload_file(f)
         data = await f.read()
         list_exterior_bytes.append(data)
+        exterior_file_summaries.append(_upload_file_summary(f, data, index))
         path = await storage_provider.save_image(data, category="exterior")
         exterior_paths.append(path)
         
     # Extraction et Sauvegarde image intérieure si présente
     interior_bytes = None
     interior_path = None
+    interior_file_summary = None
     if file_interior:
         print("💎 [Anticipation] Une photo de coupe interne a été fournie dès le départ !")
         await validate_upload_file(file_interior)
         interior_bytes = await file_interior.read()
+        interior_file_summary = _upload_file_summary(file_interior, interior_bytes, 0)
         interior_path = await storage_provider.save_image(interior_bytes, category="interior")
     else:
         print("🔍 Analyse basée uniquement sur les caractéristiques extérieures.")
+
+    _print_scan_event(
+        "ScanInput",
+        {
+            "client_uuid": metadata.client_uuid,
+            "user_id": metadata.user_id,
+            "client_platform": _detect_client_platform(user_agent),
+            "user_agent": (user_agent or "")[:180],
+            "accept_language": accept_language,
+            "exterior_count": len(list_exterior_bytes),
+            "exterior_files": exterior_file_summaries,
+            "interior_file": interior_file_summary,
+            "metadata": {
+                "weight": metadata.weight,
+                "magnetic": metadata.magnetic,
+                "latitude_provided": metadata.latitude is not None,
+                "longitude_provided": metadata.longitude is not None,
+            },
+        },
+    )
 
     if vision_pipeline is None:
         raise AppProductionException("SERVICE_UNAVAILABLE", "Pipeline IA indisponible.", 503)
@@ -1274,6 +1407,21 @@ async def scan_exterior(
             fusion_results,
             language=accept_language,
             has_interior_cut=bool(interior_path),
+        )
+        _print_scan_event(
+            "ScanResult",
+            {
+                "client_uuid": metadata.client_uuid,
+                "user_id": metadata.user_id,
+                "is_sync_retry": False,
+                "client_platform": _detect_client_platform(user_agent),
+                "status_code": final_decision["status_code"],
+                "meteorite_probability": _round_score(final_decision["meteorite_probability"]),
+                "dominant_class": final_decision["dominant_class"],
+                "class_confidence": _round_score(final_decision["class_confidence"]),
+                "vision": _vision_output_summary(vision_results),
+                "metadata_applied": fusion_results.get("metadata_applied"),
+            },
         )
 
     except Exception as e:
