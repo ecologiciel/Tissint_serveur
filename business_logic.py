@@ -84,9 +84,9 @@ class BusinessOrchestrator:
             if resolved_language == "fr":
                 class_part = f" et la classe la plus probable est {dominant_class}" if show_subclass else ""
                 cut_part = (
-                    "Photo de coupe prise en compte : dossier renforcé, badge supérieur et visibilité marché améliorée."
+                    "Photo de coupe prise en compte : l'analyse a été approfondie, mais le résultat reste à confirmer."
                     if has_interior_cut
-                    else "Ajoutez une photo de coupe pour débloquer le niveau supérieur : badge renforcé, meilleure visibilité sur le marché et dossier plus crédible pour les acheteurs/experts."
+                    else "Ajoutez une photo de coupe intérieure pour approfondir l'analyse : les images extérieures seules ne permettent pas encore de statuer avec assez de fiabilité."
                 )
                 body = (
                     f"Félicitations avec prudence. Le score d'analyse est de {score}%"
@@ -95,9 +95,9 @@ class BusinessOrchestrator:
             else:
                 class_part = f" والفئة الأقرب هي {dominant_class}" if show_subclass else ""
                 cut_part = (
-                    "تم احتساب صورة القطع الداخلي: ملف أقوى، شارة أعلى، وظهور محسّن في السوق."
+                    "تم احتساب صورة القطع الداخلي: تم تعميق التحليل، لكن النتيجة ما زالت تحتاج إلى تأكيد."
                     if has_interior_cut
-                    else "أضف صورة للقطع الداخلي لفتح المستوى الأعلى: شارة أقوى، ظهور أفضل في السوق، وملف أكثر مصداقية لدى المشترين والخبراء."
+                    else "أضف صورة للقطع الداخلي لتعميق التحليل: الصور الخارجية وحدها لا تسمح للنظام بالحسم بدرجة موثوقية كافية."
                 )
                 body = (
                     f"تهانينا بحذر. نتيجة التحليل هي {score}%"

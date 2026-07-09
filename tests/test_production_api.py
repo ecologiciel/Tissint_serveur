@@ -397,6 +397,8 @@ def test_scan_diagnostic_messages_are_deterministic():
     assert hesitant["message"]["tone"] == "warning"
     assert "70.0%" in hesitant["message"]["body"]
     assert "Meteore_Unknown" not in hesitant["message"]["body"]
+    assert "الصور الخارجية وحدها" in hesitant["message"]["body"]
+    assert "المستوى الأعلى" not in hesitant["message"]["body"]
 
     rejected_by_threshold = orchestrator.evaluate_decision(
         {
