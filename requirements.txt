@@ -23,6 +23,7 @@ Pillow>=10.2.0
 numpy>=1.26.0
 opencv-python-headless>=4.9.0.80
 python-multipart
+pytesseract>=0.3.10
 
 # Modèles IA CPU
 torch>=2.3.0

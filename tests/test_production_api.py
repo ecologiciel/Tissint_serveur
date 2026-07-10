@@ -1,9 +1,11 @@
 import os
 import uuid
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw
 
 os.environ.setdefault("TINSSIT_SKIP_MODEL_LOAD", "1")
 os.environ.setdefault("API_KEY", "tissint_ci_key")
@@ -360,6 +362,21 @@ def high_confidence_vision_results(include_interior: bool = False) -> dict:
     return result
 
 
+def capture_test_image_bytes(label: str = "front") -> bytes:
+    image = Image.new("RGB", (900, 900), (126, 126, 126))
+    draw = ImageDraw.Draw(image)
+    for x in range(0, 900, 18):
+        color = (70 + (x % 90), 92, 120)
+        draw.line((x, 0, 900 - x // 2, 899), fill=color, width=3)
+    for y in range(0, 900, 22):
+        draw.line((0, y, 899, (y * 3) % 900), fill=(160, 142, 110), width=2)
+    draw.ellipse((220, 190, 700, 705), outline=(40, 40, 40), width=12)
+    draw.text((330, 410), label, fill=(10, 10, 10))
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=92)
+    return output.getvalue()
+
+
 def test_scan_diagnostic_messages_are_deterministic():
     orchestrator = BusinessOrchestrator()
 
@@ -660,6 +677,128 @@ def test_scan_validation_and_error_envelope(client: TestClient):
     )
     assert invalid_file_type.status_code == 415
     assert error_code(invalid_file_type) == "INVALID_FILE_FORMAT"
+
+
+def test_capture_session_submit_consumes_quota_only_on_ai_submit(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeVisionPipeline:
+        def process_full_scan(self, list_exterior_bytes: list[bytes], interior_bytes: bytes | None = None) -> dict:
+            assert len(list_exterior_bytes) == 3
+            return high_confidence_vision_results(include_interior=interior_bytes is not None)
+
+    monkeypatch.setattr(main_module, "vision_pipeline", FakeVisionPipeline())
+    monkeypatch.setattr(
+        main_module,
+        "_image_quality_report",
+        lambda data: {"passed": True, "issues": [], "score": 0.97, "bytes": len(data)},
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_contact_guard_report",
+        lambda _data: {"passed": True, "status": "checked", "engine": "test", "matched_patterns": []},
+    )
+
+    session = register_user(client, "capture")
+    user_id = session["user"]["id"]
+    auth_headers = api_headers(session["access_token"])
+    before_tokens = run_in_app_loop(client, read_remaining_tokens, user_id)
+
+    create_response = client.post(
+        "/api/v1/scan/capture-sessions",
+        headers=auth_headers,
+        json={
+            "client_uuid": f"capture-{unique_suffix()}",
+            "user_id": user_id,
+            "weight": 42.0,
+            "magnetic": True,
+            "capture_mode": "mobile_camera",
+        },
+    )
+    assert create_response.status_code == 201, create_response.text
+    capture_session = create_response.json()
+    assert capture_session["required_steps"] == ["front", "side", "back"]
+    assert run_in_app_loop(client, read_remaining_tokens, user_id) == before_tokens
+
+    for step_name in capture_session["required_steps"]:
+        upload_response = client.post(
+            f"/api/v1/scan/capture-sessions/{capture_session['session_id']}/images",
+            headers=auth_headers,
+            data={"step": step_name},
+            files={"image": (f"{step_name}.jpg", capture_test_image_bytes(step_name), "image/jpeg")},
+        )
+        assert upload_response.status_code == 200, upload_response.text
+        assert upload_response.json()["accepted"] is True
+
+    assert run_in_app_loop(client, read_remaining_tokens, user_id) == before_tokens
+
+    submit_response = client.post(
+        f"/api/v1/scan/capture-sessions/{capture_session['session_id']}/submit",
+        headers=auth_headers,
+    )
+    assert submit_response.status_code == 200, submit_response.text
+    submitted = submit_response.json()
+    assert submitted["scan_id"]
+    assert submitted["capture_verified"] is True
+    assert submitted["capture_mode"] == "mobile_camera"
+    assert submitted["contact_guard"]["front"]["passed"] is True
+    assert run_in_app_loop(client, read_remaining_tokens, user_id) == before_tokens - 1
+
+
+def test_capture_session_rejects_contact_detected_in_image(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        main_module,
+        "_image_quality_report",
+        lambda data: {"passed": True, "issues": [], "score": 0.97, "bytes": len(data)},
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_contact_guard_report",
+        lambda _data: {"passed": False, "status": "checked", "engine": "test", "matched_patterns": ["phone"]},
+    )
+
+    session = register_user(client, "capture-contact")
+    user_id = session["user"]["id"]
+    auth_headers = api_headers(session["access_token"])
+    create_response = client.post(
+        "/api/v1/scan/capture-sessions",
+        headers=auth_headers,
+        json={"client_uuid": f"contact-{unique_suffix()}", "user_id": user_id, "capture_mode": "mobile_camera"},
+    )
+    assert create_response.status_code == 201, create_response.text
+    upload_response = client.post(
+        f"/api/v1/scan/capture-sessions/{create_response.json()['session_id']}/images",
+        headers=auth_headers,
+        data={"step": "front"},
+        files={"image": ("front.jpg", capture_test_image_bytes("front"), "image/jpeg")},
+    )
+    assert upload_response.status_code == 400
+    assert error_code(upload_response) == "CONTACT_IN_IMAGE_DETECTED"
+
+
+def test_legacy_upload_can_be_disabled_for_production_mobile(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(main_module, "ALLOW_LEGACY_SCAN_UPLOAD", False)
+    session = register_user(client, "legacy-disabled")
+    user_id = session["user"]["id"]
+    legacy_response = client.post(
+        "/api/v1/scan/exterior",
+        headers=api_headers(session["access_token"]),
+        data={"client_uuid": f"legacy-{unique_suffix()}", "user_id": user_id},
+        files=[
+            ("files_exterior", ("one.jpg", b"jpeg-one", "image/jpeg")),
+            ("files_exterior", ("two.jpg", b"jpeg-two", "image/jpeg")),
+            ("files_exterior", ("three.jpg", b"jpeg-three", "image/jpeg")),
+        ],
+    )
+    assert legacy_response.status_code == 403
+    assert error_code(legacy_response) == "LEGACY_UPLOAD_DISABLED"
 
 
 def test_unlimited_scan_email_bypasses_quota_only_for_configured_account(

@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks, Body, Header, Query
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 import anyio
 import os
@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageOps
 
 from exceptions import (
     AppProductionException,
@@ -30,6 +30,9 @@ from schemas import (
     ApiErrorResponse,
     AuthResponse,
     AuthUserResponse,
+    CaptureImageResponse,
+    CaptureSessionCreateInput,
+    CaptureSessionResponse,
     CollectionItemResponse,
     HealthResponse,
     LoginInput,
@@ -114,6 +117,7 @@ from database import (
     UserModel,
     AuthSessionModel,
     ScanModel,
+    CaptureSessionModel,
     ListingModel,
     CollectionItemModel,
     MessageModel,
@@ -145,6 +149,14 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("UPDATE listings SET status = 'published' WHERE status = 'available'"))
         await conn.execute(text("UPDATE listings SET status = 'admin_reserved' WHERE status = 'reserved'"))
         await conn.execute(text("UPDATE listings SET status = 'archived' WHERE status = 'inactive'"))
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS capture_session_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS capture_mode VARCHAR"))
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS capture_verified BOOLEAN DEFAULT FALSE"))
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS quality_report JSONB"))
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS image_hashes JSONB"))
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS contact_guard JSONB"))
+        await conn.execute(text("UPDATE scans SET capture_mode = 'legacy_upload' WHERE capture_mode IS NULL"))
+        await conn.execute(text("UPDATE scans SET capture_verified = FALSE WHERE capture_verified IS NULL"))
         await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'none'"))
         await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS provider VARCHAR"))
         await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS plan VARCHAR"))
@@ -209,6 +221,198 @@ vision_pipeline = None if SKIP_MODEL_LOAD else VisionPipeline()
 fusion_engine = MeteoriteFusionEngine()
 business_orchestrator = BusinessOrchestrator()
 METEORITE_CLASSES = ["None", "Achondrite", "Carbonee", "Chondrite", "Metallique", "Meteore_Unknown"]
+ALLOW_LEGACY_SCAN_UPLOAD = os.getenv("ALLOW_LEGACY_SCAN_UPLOAD", "1") == "1"
+CAPTURE_REQUIRED_STEPS = ["front", "side", "back"]
+CAPTURE_OPTIONAL_STEPS = ["macro", "interior"]
+CAPTURE_ALL_STEPS = CAPTURE_REQUIRED_STEPS + CAPTURE_OPTIONAL_STEPS
+CAPTURE_SESSION_TTL_MINUTES = int(os.getenv("CAPTURE_SESSION_TTL_MINUTES", "45"))
+CAPTURE_QUALITY_THRESHOLDS = {
+    "min_width": int(os.getenv("CAPTURE_MIN_WIDTH", "640")),
+    "min_height": int(os.getenv("CAPTURE_MIN_HEIGHT", "640")),
+    "min_sharpness": float(os.getenv("CAPTURE_MIN_SHARPNESS", "18")),
+    "min_brightness": float(os.getenv("CAPTURE_MIN_BRIGHTNESS", "35")),
+    "max_brightness": float(os.getenv("CAPTURE_MAX_BRIGHTNESS", "235")),
+    "max_highlight_ratio": float(os.getenv("CAPTURE_MAX_HIGHLIGHT_RATIO", "0.18")),
+}
+CONTACT_DIGIT_TRANSLATION = str.maketrans({
+    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+})
+IMAGE_CONTACT_PATTERNS = [
+    re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE),
+    re.compile(r"(whatsapp|wsp|wa\.me|واتساب|واتس)", re.IGNORECASE),
+    re.compile(r"(https?://|www\.|\.com|\.ma)", re.IGNORECASE),
+    re.compile(r"(?:\+?212|0)(?:[\s().-]?\d){8,}"),
+    re.compile(r"(?:\+?\d[\s().-]?){9,}"),
+]
+
+
+def _capture_quality_thresholds_response() -> dict:
+    return dict(CAPTURE_QUALITY_THRESHOLDS)
+
+
+def _now_naive_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _read_stored_file_bytes(stored_path: str) -> bytes:
+    with open(stored_path, "rb") as handle:
+        return handle.read()
+
+
+def _compute_laplacian_like_variance(gray: "Any") -> float:
+    try:
+        import numpy as np
+    except Exception:
+        return 0.0
+
+    arr = np.asarray(gray, dtype=np.float32)
+    if arr.size == 0:
+        return 0.0
+    lap = (
+        -4 * arr[1:-1, 1:-1]
+        + arr[:-2, 1:-1]
+        + arr[2:, 1:-1]
+        + arr[1:-1, :-2]
+        + arr[1:-1, 2:]
+    )
+    return float(np.var(lap)) if lap.size else 0.0
+
+
+def _image_quality_report(image_bytes: bytes) -> dict:
+    issues: list[str] = []
+    with Image.open(io.BytesIO(image_bytes)) as raw_image:
+        image = ImageOps.exif_transpose(raw_image).convert("RGB")
+        width, height = image.size
+        gray = image.convert("L")
+        try:
+            import numpy as np
+
+            gray_arr = np.asarray(gray, dtype=np.float32)
+            rgb_arr = np.asarray(image, dtype=np.uint8)
+            brightness = float(np.mean(gray_arr))
+            highlight_ratio = float(np.mean(gray_arr >= 245))
+            shadow_ratio = float(np.mean(gray_arr <= 18))
+            saturation_high_ratio = float(np.mean(np.max(rgb_arr, axis=2) >= 248))
+        except Exception:
+            histogram = gray.histogram()
+            total = max(1, sum(histogram))
+            brightness = sum(i * count for i, count in enumerate(histogram)) / total
+            highlight_ratio = sum(histogram[245:]) / total
+            shadow_ratio = sum(histogram[:19]) / total
+            saturation_high_ratio = highlight_ratio
+        sharpness = _compute_laplacian_like_variance(gray)
+
+    thresholds = CAPTURE_QUALITY_THRESHOLDS
+    if width < thresholds["min_width"] or height < thresholds["min_height"]:
+        issues.append("LOW_RESOLUTION")
+    if sharpness < thresholds["min_sharpness"]:
+        issues.append("BLURRY")
+    if brightness < thresholds["min_brightness"]:
+        issues.append("UNDEREXPOSED")
+    if brightness > thresholds["max_brightness"]:
+        issues.append("OVEREXPOSED")
+    if highlight_ratio > thresholds["max_highlight_ratio"] or saturation_high_ratio > thresholds["max_highlight_ratio"]:
+        issues.append("GLARE_OR_HIGHLIGHTS")
+
+    quality_score = max(
+        0.0,
+        min(
+            1.0,
+            0.30 * min(width, height) / max(thresholds["min_width"], thresholds["min_height"])
+            + 0.35 * min(sharpness / max(1.0, thresholds["min_sharpness"] * 3), 1.0)
+            + 0.20 * (1.0 - min(abs(brightness - 128.0) / 128.0, 1.0))
+            + 0.15 * (1.0 - min(highlight_ratio / max(0.01, thresholds["max_highlight_ratio"]), 1.0))
+        ),
+    )
+    return {
+        "passed": not issues,
+        "issues": issues,
+        "width": width,
+        "height": height,
+        "bytes": len(image_bytes),
+        "sharpness": round(sharpness, 3),
+        "brightness": round(brightness, 3),
+        "highlight_ratio": round(highlight_ratio, 5),
+        "shadow_ratio": round(shadow_ratio, 5),
+        "score": round(quality_score, 4),
+        "thresholds": _capture_quality_thresholds_response(),
+    }
+
+
+def _normalize_contact_text(value: str) -> str:
+    return (value or "").translate(CONTACT_DIGIT_TRANSLATION)
+
+
+def _extract_text_from_image(image_bytes: bytes) -> tuple[str, str]:
+    try:
+        import pytesseract
+    except Exception:
+        return "", "unavailable"
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as raw_image:
+            image = ImageOps.exif_transpose(raw_image).convert("RGB")
+            text = pytesseract.image_to_string(image, lang=os.getenv("TISSINT_OCR_LANG", "ara+fra+eng"))
+            return text or "", "pytesseract"
+    except Exception:
+        return "", "unavailable"
+
+
+def _contact_guard_report(image_bytes: bytes) -> dict:
+    extracted_text, engine = _extract_text_from_image(image_bytes)
+    normalized = _normalize_contact_text(extracted_text)
+    matched = [
+        pattern.pattern
+        for pattern in IMAGE_CONTACT_PATTERNS
+        if pattern.search(normalized)
+    ]
+    status_value = "checked" if engine != "unavailable" else "not_available"
+    return {
+        "passed": not matched,
+        "status": status_value,
+        "engine": engine,
+        "matched_patterns": matched,
+        "text_sample": normalized[:120] if normalized else "",
+    }
+
+
+def _capture_step_paths(session: CaptureSessionModel) -> dict:
+    metadata = session.capture_metadata or {}
+    return dict(metadata.get("step_paths") or {})
+
+
+def _set_capture_step_path(session: CaptureSessionModel, step: str, stored_path: str) -> None:
+    metadata = dict(session.capture_metadata or {})
+    step_paths = dict(metadata.get("step_paths") or {})
+    step_paths[step] = stored_path
+    metadata["step_paths"] = step_paths
+    session.capture_metadata = metadata
+    session.exterior_images_paths = [
+        step_paths[step_name]
+        for step_name in CAPTURE_REQUIRED_STEPS + ["macro"]
+        if step_paths.get(step_name)
+    ]
+    if step == "interior":
+        session.interior_image_path = stored_path
+    session.updated_at = _now_naive_utc()
+
+
+def _capture_count(session: CaptureSessionModel) -> int:
+    step_paths = _capture_step_paths(session)
+    return sum(1 for step_name in CAPTURE_REQUIRED_STEPS if step_paths.get(step_name))
+
+
+def _session_required_paths(session: CaptureSessionModel) -> list[str]:
+    step_paths = _capture_step_paths(session)
+    return [step_paths[step_name] for step_name in CAPTURE_REQUIRED_STEPS if step_paths.get(step_name)]
+
+
+def _session_interior_path(session: CaptureSessionModel) -> Optional[str]:
+    step_paths = _capture_step_paths(session)
+    return step_paths.get("interior") or session.interior_image_path
 
 
 def _round_score(value: Optional[float]) -> Optional[float]:
@@ -1271,6 +1475,350 @@ async def _sync_collection_status_for_listing(
     for collection in result.scalars().all():
         collection.status = _collection_status_for_scan(scan, listing)
 
+
+@app.post(
+    "/api/v1/scan/capture-sessions",
+    response_model=CaptureSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def create_capture_session(
+    payload: CaptureSessionCreateInput,
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    actor_user_id, _actor_user, _subscription = await _check_scan_quota_for_request(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        form_user_id=payload.user_id,
+    )
+    result = await db.execute(select(CaptureSessionModel).where(CaptureSessionModel.client_uuid == payload.client_uuid))
+    existing = result.scalar_one_or_none()
+    if existing:
+        if existing.user_id != actor_user_id:
+            raise AppProductionException("FORBIDDEN", "Session de capture divergente.", 403)
+        return CaptureSessionResponse(
+            session_id=existing.id,
+            client_uuid=existing.client_uuid,
+            capture_mode=existing.capture_mode,
+            expected_steps=existing.expected_steps,
+            required_steps=CAPTURE_REQUIRED_STEPS,
+            expires_at=existing.expires_at.isoformat(),
+            quality_thresholds=_capture_quality_thresholds_response(),
+        )
+
+    now = _now_naive_utc()
+    session = CaptureSessionModel(
+        id=str(uuid.uuid4()),
+        client_uuid=payload.client_uuid,
+        user_id=actor_user_id,
+        status="active",
+        capture_mode="mobile_camera",
+        expected_steps=CAPTURE_ALL_STEPS,
+        capture_metadata={
+            "weight": payload.weight,
+            "magnetic": payload.magnetic,
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "step_paths": {},
+        },
+        quality_report={},
+        image_hashes={},
+        contact_guard={},
+        expires_at=now + timedelta(minutes=CAPTURE_SESSION_TTL_MINUTES),
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(session)
+    await db.commit()
+    return CaptureSessionResponse(
+        session_id=session.id,
+        client_uuid=session.client_uuid,
+        capture_mode=session.capture_mode,
+        expected_steps=session.expected_steps,
+        required_steps=CAPTURE_REQUIRED_STEPS,
+        expires_at=session.expires_at.isoformat(),
+        quality_thresholds=_capture_quality_thresholds_response(),
+    )
+
+
+@app.post(
+    "/api/v1/scan/capture-sessions/{session_id}/images",
+    response_model=CaptureImageResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def upload_capture_session_image(
+    session_id: str,
+    step: str = Form(...),
+    image: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    actor_user_id, _user, _subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        require_user=True,
+    )
+    step = (step or "").strip().lower()
+    if step not in CAPTURE_ALL_STEPS:
+        raise AppProductionException("INVALID_CAPTURE_STEP", "Etape de capture invalide.", 400)
+
+    result = await db.execute(select(CaptureSessionModel).where(CaptureSessionModel.id == session_id))
+    session = result.scalar_one_or_none()
+    if not session or session.user_id != actor_user_id:
+        raise AppProductionException("NOT_FOUND", "Session de capture introuvable.", 404)
+    if session.status != "active":
+        raise AppProductionException("CONFLICT", "Session de capture deja finalisee.", 409)
+    if session.expires_at < _now_naive_utc():
+        session.status = "expired"
+        await db.commit()
+        raise AppProductionException("CAPTURE_SESSION_EXPIRED", "Session de capture expiree.", 409)
+
+    await validate_upload_file(image)
+    image_bytes = await image.read()
+    try:
+        quality = _image_quality_report(image_bytes)
+    except Exception:
+        raise AppProductionException("INVALID_IMAGE", "Image illisible.", 415)
+    if not quality.get("passed"):
+        raise AppProductionException("PHOTO_QUALITY_REJECTED", "Photo insuffisante. Reprenez une image plus nette et mieux eclairee.", 400)
+
+    contact_guard = _contact_guard_report(image_bytes)
+    if not contact_guard.get("passed"):
+        raise AppProductionException("CONTACT_IN_IMAGE_DETECTED", "Un numero de telephone, WhatsApp, email ou lien est visible dans l'image.", 400)
+
+    stored_path = await storage_provider.save_image(
+        image_bytes,
+        category="interior" if step == "interior" else "exterior",
+    )
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+    quality_report = dict(session.quality_report or {})
+    image_hashes = dict(session.image_hashes or {})
+    contact_report = dict(session.contact_guard or {})
+    quality_report[step] = quality
+    image_hashes[step] = image_hash
+    contact_report[step] = contact_guard
+    session.quality_report = quality_report
+    session.image_hashes = image_hashes
+    session.contact_guard = contact_report
+    _set_capture_step_path(session, step, stored_path)
+    await db.commit()
+
+    return CaptureImageResponse(
+        session_id=session.id,
+        step=step,
+        accepted=True,
+        quality=quality,
+        contact_guard=contact_guard,
+        image_hash=image_hash,
+        captured_count=_capture_count(session),
+        required_count=len(CAPTURE_REQUIRED_STEPS),
+        message="Photo acceptee.",
+    )
+
+
+@app.post(
+    "/api/v1/scan/capture-sessions/{session_id}/submit",
+    response_model=ScanDecisionResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def submit_capture_session(
+    session_id: str,
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+    accept_language: Optional[str] = Header(None, alias="Accept-Language"),
+):
+    actor_user_id, actor_user, subscription = await _resolve_mobile_identity(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        require_user=True,
+    )
+    result = await db.execute(select(CaptureSessionModel).where(CaptureSessionModel.id == session_id))
+    session = result.scalar_one_or_none()
+    if not session or session.user_id != actor_user_id:
+        raise AppProductionException("NOT_FOUND", "Session de capture introuvable.", 404)
+    if session.expires_at < _now_naive_utc():
+        session.status = "expired"
+        await db.commit()
+        raise AppProductionException("CAPTURE_SESSION_EXPIRED", "Session de capture expiree.", 409)
+
+    actor_user_id, actor_user, subscription = await _check_scan_quota_for_request(
+        db,
+        authorization=authorization,
+        x_user_id=x_user_id,
+        form_user_id=session.user_id,
+    )
+
+    metadata = session.capture_metadata or {}
+    existing_result = await db.execute(select(ScanModel).where(ScanModel.client_uuid == session.client_uuid))
+    existing_scan = existing_result.scalar_one_or_none()
+    if existing_scan:
+        displayed_score = _scan_user_score(existing_scan)
+        has_interior_cut = bool(existing_scan.interior_image_path)
+        actions = business_orchestrator.build_scan_actions(existing_scan.status_code, has_interior_cut=has_interior_cut)
+        return {
+            "status_code": existing_scan.status_code,
+            "is_meteorite": existing_scan.is_meteorite,
+            "meteorite_probability": displayed_score,
+            "dominant_class": existing_scan.dominant_class,
+            "class_confidence": existing_scan.class_confidence,
+            "has_interior_cut": has_interior_cut,
+            "actions": actions,
+            "trigger_radar_admin": False,
+            "metadata_applied": {
+                "weight_provided": existing_scan.weight is not None,
+                "magnetic_status": existing_scan.magnetic,
+                "has_coordinates": existing_scan.latitude is not None and existing_scan.longitude is not None,
+            },
+            "message": business_orchestrator.build_message(
+                status_code=existing_scan.status_code,
+                dominant_class=existing_scan.dominant_class,
+                meteorite_probability=displayed_score,
+                actions=actions,
+                language=accept_language,
+                has_interior_cut=has_interior_cut,
+            ),
+            "scan_id": existing_scan.id,
+            "is_sync_retry": True,
+            "capture_verified": existing_scan.capture_verified,
+            "capture_mode": existing_scan.capture_mode,
+            "quality_report": existing_scan.quality_report,
+            "contact_guard": existing_scan.contact_guard,
+        }
+
+    exterior_paths = _session_required_paths(session)
+    if len(exterior_paths) < len(CAPTURE_REQUIRED_STEPS):
+        raise AppProductionException(
+            "MISSING_EXTERNAL_PHOTOS",
+            f"Action obligatoire : vous devez fournir {len(CAPTURE_REQUIRED_STEPS)} photos exterieures validees.",
+            400,
+        )
+
+    if vision_pipeline is None:
+        raise AppProductionException("SERVICE_UNAVAILABLE", "Pipeline IA indisponible.", 503)
+
+    list_exterior_bytes = [_read_stored_file_bytes(path) for path in exterior_paths]
+    interior_path = _session_interior_path(session)
+    interior_bytes = _read_stored_file_bytes(interior_path) if interior_path else None
+
+    try:
+        vision_results = await anyio.to_thread.run_sync(
+            vision_pipeline.process_full_scan,
+            list_exterior_bytes,
+            interior_bytes,
+        )
+        fusion_results = fusion_engine.fuse_outputs(
+            vision_outputs=vision_results,
+            weight=metadata.get("weight"),
+            magnetic=metadata.get("magnetic"),
+            latitude=metadata.get("latitude"),
+            longitude=metadata.get("longitude"),
+        )
+        final_decision = business_orchestrator.evaluate_decision(
+            fusion_results,
+            language=accept_language,
+            has_interior_cut=bool(interior_path),
+        )
+        _print_scan_event(
+            "CaptureScanResult",
+            {
+                "client_uuid": session.client_uuid,
+                "session_id": session.id,
+                "user_id": session.user_id,
+                "client_platform": _detect_client_platform(user_agent),
+                "status_code": final_decision["status_code"],
+                "meteorite_probability": _round_score(final_decision["meteorite_probability"]),
+                "dominant_class": final_decision["dominant_class"],
+                "class_confidence": _round_score(final_decision["class_confidence"]),
+                "vision": _vision_output_summary(vision_results),
+            },
+        )
+    except Exception as e:
+        raise AppProductionException("INTERNAL_PROCESSING_ERROR", f"Erreur de traitement IA: {str(e)}", 500)
+
+    scan_id = str(uuid.uuid4())
+    new_scan = ScanModel(
+        id=scan_id,
+        client_uuid=session.client_uuid,
+        user_id=session.user_id,
+        status_code=final_decision["status_code"],
+        is_meteorite=final_decision["is_meteorite"],
+        meteorite_probability=final_decision["meteorite_probability"],
+        dominant_class=final_decision["dominant_class"],
+        class_confidence=final_decision["class_confidence"],
+        weight=metadata.get("weight"),
+        magnetic=metadata.get("magnetic"),
+        latitude=metadata.get("latitude"),
+        longitude=metadata.get("longitude"),
+        raw_vision_outputs=vision_results,
+        exterior_images_paths=exterior_paths,
+        interior_image_path=interior_path,
+        capture_session_id=session.id,
+        capture_mode=session.capture_mode,
+        capture_verified=True,
+        quality_report=session.quality_report,
+        image_hashes=session.image_hashes,
+        contact_guard=session.contact_guard,
+    )
+    session.status = "submitted"
+    session.updated_at = _now_naive_utc()
+    db.add(new_scan)
+    await _create_notification(
+        db,
+        user_id=session.user_id,
+        type_value="scan_ready",
+        title="نتيجة المسح جاهزة",
+        body=f"{final_decision['dominant_class']} - {final_decision['meteorite_probability'] * 100:.1f}/100",
+        action="scanResult",
+        metadata={"scan_id": scan_id, "capture_session_id": session.id},
+    )
+    await db.commit()
+
+    await decrement_quota(subscription.user_id, db)
+    refreshed_subscription = await get_or_create_subscription(subscription.user_id, db)
+    if (
+        not is_unlimited_scan_user(actor_user)
+        and refreshed_subscription.tier == "free"
+        and refreshed_subscription.remaining_tokens <= 1
+    ):
+        await _create_notification(
+            db,
+            user_id=session.user_id,
+            type_value="quota_warning",
+            title="Quota bientot epuise",
+            body=f"Il vous reste {refreshed_subscription.remaining_tokens} scan gratuit.",
+            action="premium",
+        )
+        await db.commit()
+
+    final_decision["scan_id"] = scan_id
+    final_decision["capture_verified"] = True
+    final_decision["capture_mode"] = session.capture_mode
+    final_decision["quality_report"] = session.quality_report
+    final_decision["contact_guard"] = session.contact_guard
+    await _send_push_to_user(
+        db,
+        session.user_id,
+        {
+            "title": "نتيجة المسح جاهزة",
+            "body": f"نقاط: {final_decision['meteorite_probability'] * 100:.1f}/100 - {final_decision['dominant_class']}",
+            "data": {"action": "scanResult", "scan_id": scan_id},
+        },
+    )
+    return final_decision
+
 @app.post(
     "/api/v1/scan/exterior",
     response_model=ScanDecisionResponse,
@@ -1299,6 +1847,12 @@ async def scan_exterior(
         x_user_id=x_user_id,
         form_user_id=user_id,
     )
+    if not ALLOW_LEGACY_SCAN_UPLOAD:
+        raise AppProductionException(
+            "LEGACY_UPLOAD_DISABLED",
+            "Le scan par upload est desactive en production. Utilisez la capture camera Tissint.",
+            403,
+        )
     try:
         metadata = ScanMetadataInput(
             client_uuid=client_uuid,
@@ -1487,7 +2041,15 @@ async def scan_exterior(
         longitude=metadata.longitude,
         raw_vision_outputs=vision_results,
         exterior_images_paths=exterior_paths,
-        interior_image_path=interior_path
+        interior_image_path=interior_path,
+        capture_mode="legacy_upload",
+        capture_verified=False,
+        quality_report=None,
+        image_hashes={
+            "exterior": [summary.get("sha256_16") for summary in exterior_file_summaries],
+            "interior": interior_file_summary.get("sha256_16") if interior_file_summary else None,
+        },
+        contact_guard={"status": "unchecked", "passed": True},
     )
     
     db.add(new_scan)

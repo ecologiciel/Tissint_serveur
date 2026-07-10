@@ -15,6 +15,10 @@ RUN apt-get update \
         curl \
         git \
         libgomp1 \
+        tesseract-ocr \
+        tesseract-ocr-ara \
+        tesseract-ocr-eng \
+        tesseract-ocr-fra \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

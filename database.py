@@ -73,6 +73,31 @@ class ScanModel(Base):
     # Chemins de stockage des fichiers pour découplage
     exterior_images_paths = Column(JSONB, nullable=False, default=list)
     interior_image_path = Column(String, nullable=True)
+    capture_session_id = Column(String, index=True, nullable=True)
+    capture_mode = Column(String, nullable=True)
+    capture_verified = Column(Boolean, nullable=False, default=False)
+    quality_report = Column(JSONB, nullable=True)
+    image_hashes = Column(JSONB, nullable=True)
+    contact_guard = Column(JSONB, nullable=True)
+
+class CaptureSessionModel(Base):
+    __tablename__ = "capture_sessions"
+
+    id = Column(String, primary_key=True, index=True)
+    client_uuid = Column(String, unique=True, index=True, nullable=False)
+    user_id = Column(String, index=True, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    capture_mode = Column(String, nullable=False, default="mobile_camera")
+    expected_steps = Column(JSONB, nullable=False, default=list)
+    capture_metadata = Column(JSONB, nullable=True)
+    exterior_images_paths = Column(JSONB, nullable=False, default=list)
+    interior_image_path = Column(String, nullable=True)
+    quality_report = Column(JSONB, nullable=True)
+    image_hashes = Column(JSONB, nullable=True)
+    contact_guard = Column(JSONB, nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 class ListingModel(Base):
     __tablename__ = "listings"

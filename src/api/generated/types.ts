@@ -114,6 +114,44 @@ export type Body_scan_interior_update_api_v1_scan__scan_id__interior_patch = {
   "file_interior": string;
 };
 
+export type Body_upload_capture_session_image_api_v1_scan_capture_sessions__session_id__images_post = {
+  "step": string;
+  "image": string;
+};
+
+export type CaptureImageResponse = {
+  "ok"?: boolean;
+  "session_id": string;
+  "step": string;
+  "accepted": boolean;
+  "quality": Record<string, unknown>;
+  "contact_guard": Record<string, unknown>;
+  "image_hash": string;
+  "captured_count": number;
+  "required_count": number;
+  "message": string;
+};
+
+export type CaptureSessionCreateInput = {
+  "client_uuid": string;
+  "user_id": string;
+  "weight"?: number | null;
+  "magnetic"?: boolean | null;
+  "latitude"?: number | null;
+  "longitude"?: number | null;
+  "capture_mode"?: string;
+};
+
+export type CaptureSessionResponse = {
+  "session_id": string;
+  "client_uuid": string;
+  "capture_mode": string;
+  "expected_steps": string[];
+  "required_steps": string[];
+  "expires_at": string;
+  "quality_thresholds": Record<string, unknown>;
+};
+
 export type CheckoutSessionResponse = {
   "id": string;
   "provider": string;
@@ -390,6 +428,10 @@ export type ScanDecisionResponse = {
   "message": ScanDiagnosticMessage;
   "scan_id": string;
   "is_sync_retry"?: boolean;
+  "capture_verified"?: boolean;
+  "capture_mode"?: string | null;
+  "quality_report"?: unknown | null;
+  "contact_guard"?: unknown | null;
 };
 
 export type ScanDiagnosticMessage = {
@@ -486,6 +528,10 @@ export type ApiSchemas = {
   "BillingWebhookResponse": BillingWebhookResponse;
   "Body_scan_exterior_api_v1_scan_exterior_post": Body_scan_exterior_api_v1_scan_exterior_post;
   "Body_scan_interior_update_api_v1_scan__scan_id__interior_patch": Body_scan_interior_update_api_v1_scan__scan_id__interior_patch;
+  "Body_upload_capture_session_image_api_v1_scan_capture_sessions__session_id__images_post": Body_upload_capture_session_image_api_v1_scan_capture_sessions__session_id__images_post;
+  "CaptureImageResponse": CaptureImageResponse;
+  "CaptureSessionCreateInput": CaptureSessionCreateInput;
+  "CaptureSessionResponse": CaptureSessionResponse;
   "CheckoutSessionResponse": CheckoutSessionResponse;
   "CollectionItemResponse": CollectionItemResponse;
   "CreateMessageInput": CreateMessageInput;

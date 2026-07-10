@@ -93,6 +93,47 @@ class ScanDecisionResponse(BaseModel):
     message: ScanDiagnosticMessage
     scan_id: str
     is_sync_retry: bool = False
+    capture_verified: bool = False
+    capture_mode: Optional[str] = None
+    quality_report: Optional[Any] = None
+    contact_guard: Optional[Any] = None
+
+class CaptureSessionCreateInput(BaseModel):
+    client_uuid: str = Field(..., min_length=5, max_length=100)
+    user_id: str = Field(..., min_length=3, max_length=100)
+    weight: Optional[float] = Field(None, ge=0.0, le=100000.0)
+    magnetic: Optional[bool] = None
+    latitude: Optional[float] = Field(None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(None, ge=-180.0, le=180.0)
+    capture_mode: str = "mobile_camera"
+
+    @field_validator("capture_mode")
+    @classmethod
+    def validate_capture_mode(cls, value: str) -> str:
+        if value != "mobile_camera":
+            raise ValueError("Mode de capture invalide.")
+        return value
+
+class CaptureSessionResponse(BaseModel):
+    session_id: str
+    client_uuid: str
+    capture_mode: str
+    expected_steps: List[str]
+    required_steps: List[str]
+    expires_at: str
+    quality_thresholds: dict
+
+class CaptureImageResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    step: str
+    accepted: bool
+    quality: dict
+    contact_guard: dict
+    image_hash: str
+    captured_count: int
+    required_count: int
+    message: str
 
 class PublishListingInput(BaseModel):
     price: Optional[float] = Field(None, ge=0.0)
