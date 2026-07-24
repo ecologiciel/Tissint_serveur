@@ -4701,11 +4701,10 @@ async def expert_create_export(
 
     version = payload.version or f"v{_dataset_now().strftime('%Y%m%d%H%M%S')}"
     manifests: dict[str, list[dict]] = {"train": [], "validation": [], "test": []}
+    excluded: dict[str, list[dict]] = {"hard_cases": [], "unlabeled": []}
     for item, consensus in rows:
         specimen_key = item.specimen_id or item.id
-        split_hash = int(hashlib.sha256(specimen_key.encode("utf-8")).hexdigest()[:8], 16) % 100
-        split = "train" if split_hash < 80 else "validation" if split_hash < 90 else "test"
-        manifests[split].append({
+        entry = {
             "image_id": item.id,
             "specimen_id": specimen_key,
             "image_uri": item.normalized_object_key or item.original_object_key,
@@ -4717,12 +4716,24 @@ async def expert_create_export(
             "annotation_status": consensus.status,
             "model_version": item.model_version,
             "taxonomy_version": TAXONOMY_VERSION,
-            "split": split,
-        })
+        }
+        if consensus.final_label in {"uncertain", "unusable"}:
+            entry["split"] = "unlabeled"
+            excluded["unlabeled"].append(entry)
+            continue
+        if not entry["quality"]:
+            entry["split"] = "hard_cases"
+            excluded["hard_cases"].append(entry)
+            continue
+        split_hash = int(hashlib.sha256(specimen_key.encode("utf-8")).hexdigest()[:8], 16) % 100
+        split = "train" if split_hash < 80 else "validation" if split_hash < 90 else "test"
+        entry["split"] = split
+        manifests[split].append(entry)
 
     export_id = str(uuid.uuid4())
     base_key = f"datasets/{payload.dataset_id}/exports/{version}"
-    manifest = [entry for split in ("train", "validation", "test") for entry in manifests[split]]
+    supervised_manifest = [entry for split in ("train", "validation", "test") for entry in manifests[split]]
+    manifest = [*supervised_manifest, *excluded["hard_cases"], *excluded["unlabeled"]]
     await storage_provider.save_object(
         ("\n".join(json.dumps(item, ensure_ascii=False) for item in manifest) + "\n").encode("utf-8"),
         f"{base_key}/manifest.jsonl",
@@ -4734,7 +4745,18 @@ async def expert_create_export(
             f"{base_key}/{split}.jsonl",
             "application/jsonl",
         )
-    statistics = {"total": len(manifest), **{split: len(entries) for split, entries in manifests.items()}}
+    for split, entries in excluded.items():
+        await storage_provider.save_object(
+            ("\n".join(json.dumps(item, ensure_ascii=False) for item in entries) + "\n").encode("utf-8"),
+            f"{base_key}/{split}.jsonl",
+            "application/jsonl",
+        )
+    statistics = {
+        "total": len(manifest),
+        "supervised_total": len(supervised_manifest),
+        **{split: len(entries) for split, entries in manifests.items()},
+        **{split: len(entries) for split, entries in excluded.items()},
+    }
     export = DatasetExportModel(
         id=export_id,
         batch_id=payload.dataset_id,
