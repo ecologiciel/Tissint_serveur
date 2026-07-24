@@ -24,6 +24,7 @@ numpy>=1.26.0
 opencv-python-headless>=4.9.0.80
 python-multipart
 pytesseract>=0.3.10
+boto3>=1.34.0
 
 # Modèles IA CPU
 torch>=2.3.0

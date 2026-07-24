@@ -69,7 +69,7 @@ def refresh_subscription_state(subscription: UserSubscription, user: UserModel |
     if subscription.tier == "admin":
         subscription.status = "active"
         subscription.updated_at = utc_now()
-        if user:
+        if user and user.role != "expert":
             user.role = "admin"
         return subscription
 
@@ -79,12 +79,12 @@ def refresh_subscription_state(subscription: UserSubscription, user: UserModel |
         subscription.cancel_at_period_end = False
         subscription.remaining_tokens = max(subscription.remaining_tokens, 0)
         subscription.updated_at = utc_now()
-        if user:
+        if user and user.role != "expert":
             user.role = "free"
 
-    if subscription.tier == "premium" and user:
+    if subscription.tier == "premium" and user and user.role != "expert":
         user.role = "premium"
-    elif subscription.tier == "free" and user:
+    elif subscription.tier == "free" and user and user.role != "expert":
         user.role = "free"
     return subscription
 
@@ -206,7 +206,7 @@ async def activate_subscription(
     subscription.subscription_expires_at = base_date + PLAN_DURATIONS[plan]
     subscription.remaining_tokens = quota_limit_for_tier(subscription.tier)
     subscription.updated_at = now
-    if user.role != "admin":
+    if user.role not in {"admin", "expert"}:
         user.role = "premium"
     db.add(subscription)
     db.add(user)

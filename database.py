@@ -277,6 +277,113 @@ class BillingEventModel(Base):
     processed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
+
+class DatasetBatchModel(Base):
+    __tablename__ = "dataset_batches"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="active")
+    taxonomy_version = Column(String, nullable=False, default="taxonomy-v1")
+    annotation_policy_version = Column(String, nullable=False, default="annotation-policy-v1")
+    created_by = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    statistics = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class DatasetItemModel(Base):
+    __tablename__ = "dataset_items"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "sha256", name="uq_dataset_item_batch_sha256"),
+    )
+
+    id = Column(String, primary_key=True, index=True)
+    batch_id = Column(String, ForeignKey("dataset_batches.id"), index=True, nullable=False)
+    specimen_id = Column(String, index=True, nullable=True)
+    original_filename = Column(String, nullable=True)
+    content_type = Column(String, nullable=False, default="image/jpeg")
+    original_object_key = Column(String, nullable=False)
+    normalized_object_key = Column(String, nullable=True)
+    thumbnail_object_key = Column(String, nullable=True)
+    sha256 = Column(String, index=True, nullable=True)
+    perceptual_hash = Column(String, index=True, nullable=True)
+    status = Column(String, index=True, nullable=False, default="imported")
+    quality_report = Column(JSONB, nullable=True)
+    item_metadata = Column("metadata", JSONB, nullable=False, default=dict)
+    model_version = Column(String, nullable=True)
+    raw_prediction = Column(JSONB, nullable=True)
+    lease_user_id = Column(String, ForeignKey("users.id"), index=True, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class AnnotationEventModel(Base):
+    __tablename__ = "annotation_events"
+    __table_args__ = (
+        UniqueConstraint("client_uuid", name="uq_annotation_event_client_uuid"),
+    )
+
+    id = Column(String, primary_key=True, index=True)
+    dataset_item_id = Column(String, ForeignKey("dataset_items.id"), index=True, nullable=False)
+    expert_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    client_uuid = Column(String, nullable=False)
+    action = Column(String, nullable=False)
+    top_label = Column(String, nullable=True)
+    meteorite_subclass = Column(String, nullable=True)
+    terrestrial_family = Column(String, nullable=True)
+    confidence = Column(String, nullable=True)
+    comment = Column(String, nullable=True)
+    annotation_metadata = Column("metadata", JSONB, nullable=False, default=dict)
+    policy_version = Column(String, nullable=False, default="annotation-policy-v1")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class DatasetConsensusModel(Base):
+    __tablename__ = "dataset_consensus"
+
+    dataset_item_id = Column(String, ForeignKey("dataset_items.id"), primary_key=True, index=True)
+    final_label = Column(String, nullable=True)
+    meteorite_subclass = Column(String, nullable=True)
+    terrestrial_family = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    review_required = Column(Boolean, nullable=False, default=False)
+    annotation_count = Column(Integer, nullable=False, default=0)
+    finalized_by = Column(String, ForeignKey("users.id"), nullable=True)
+    finalized_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class AuditRunModel(Base):
+    __tablename__ = "audit_runs"
+
+    id = Column(String, primary_key=True, index=True)
+    batch_id = Column(String, ForeignKey("dataset_batches.id"), index=True, nullable=False)
+    created_by = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    status = Column(String, nullable=False, default="completed")
+    model_version = Column(String, nullable=False, default="trio-v1")
+    summary = Column(JSONB, nullable=False, default=dict)
+    recommendations = Column(JSONB, nullable=False, default=list)
+    report_object_key = Column(String, nullable=True)
+    errors_object_key = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    completed_at = Column(DateTime, nullable=True)
+
+
+class DatasetExportModel(Base):
+    __tablename__ = "dataset_exports"
+
+    id = Column(String, primary_key=True, index=True)
+    batch_id = Column(String, ForeignKey("dataset_batches.id"), index=True, nullable=False)
+    version = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="completed")
+    created_by = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    manifest_object_key = Column(String, nullable=True)
+    statistics = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         try:

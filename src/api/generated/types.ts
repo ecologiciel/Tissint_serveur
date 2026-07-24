@@ -99,6 +99,15 @@ export type BillingWebhookResponse = {
   "subscription"?: SubscriptionResponse | null;
 };
 
+export type Body_expert_upload_dataset_image_api_v1_expert_datasets__dataset_id__images_post = {
+  "image": string;
+  "specimen_id"?: string | null;
+  "source_type"?: string | null;
+  "origin"?: string | null;
+  "capture_type"?: string | null;
+  "has_interior_cut"?: string | null;
+};
+
 export type Body_scan_exterior_api_v1_scan_exterior_post = {
   "client_uuid": string;
   "user_id": string;
@@ -192,6 +201,149 @@ export type CreateMessageInput = {
   "sender_id": string;
   "receiver_id": string;
   "text_content": string;
+};
+
+export type ExpertAnnotationInput = {
+  "client_uuid": string;
+  "action": "label" | "skip" | "unusable" | "review";
+  "top_label"?: "meteorite" | "terrestrial_rock" | "uncertain" | "unusable" | "non_rock" | null;
+  "meteorite_subclass"?: string | null;
+  "terrestrial_family"?: string | null;
+  "confidence"?: "high" | "medium" | "low" | "not_assessed" | null;
+  "comment"?: string | null;
+  "specimen_id"?: string | null;
+  "metadata"?: Record<string, unknown>;
+};
+
+export type ExpertAnnotationResponse = {
+  "item": ExpertQueueItemResponse;
+  "annotation_id": string;
+  "consensus_status": string;
+  "review_required": boolean;
+  "next_item_available": boolean;
+  "model_version"?: string;
+  "taxonomy_version"?: string;
+  "annotation_policy_version"?: string;
+  "dataset_version"?: string | null;
+};
+
+export type ExpertAuditCreateInput = {
+  "dataset_id": string;
+  "model_version"?: string;
+};
+
+export type ExpertAuditResponse = {
+  "id": string;
+  "dataset_id": string;
+  "status": string;
+  "model_version": string;
+  "summary"?: Record<string, unknown>;
+  "recommendations"?: string[];
+  "report_url"?: string | null;
+  "errors_url"?: string | null;
+  "created_at": string;
+  "completed_at"?: string | null;
+  "taxonomy_version"?: string;
+  "annotation_policy_version"?: string;
+  "dataset_version"?: string | null;
+};
+
+export type ExpertDatasetCreateInput = {
+  "name": string;
+  "description"?: string | null;
+  "taxonomy_version"?: string;
+  "annotation_policy_version"?: string;
+};
+
+export type ExpertDatasetResponse = {
+  "id": string;
+  "name": string;
+  "description"?: string | null;
+  "status": string;
+  "taxonomy_version": string;
+  "annotation_policy_version": string;
+  "statistics"?: Record<string, unknown>;
+  "created_at": string;
+  "updated_at": string;
+  "model_version"?: string;
+};
+
+export type ExpertDatasetStatsResponse = {
+  "dataset_id": string;
+  "counts"?: Record<string, unknown>;
+  "label_counts"?: Record<string, unknown>;
+  "quality_counts"?: Record<string, unknown>;
+  "last_audit_id"?: string | null;
+  "model_version"?: string;
+  "taxonomy_version"?: string;
+  "annotation_policy_version"?: string;
+  "dataset_version"?: string | null;
+};
+
+export type ExpertExportCreateInput = {
+  "dataset_id": string;
+  "version"?: string | null;
+};
+
+export type ExpertExportResponse = {
+  "id": string;
+  "dataset_id": string;
+  "version": string;
+  "status": string;
+  "statistics"?: Record<string, unknown>;
+  "manifest_url"?: string | null;
+  "created_at": string;
+  "model_version"?: string;
+  "taxonomy_version"?: string;
+  "annotation_policy_version"?: string;
+  "dataset_version"?: string | null;
+};
+
+export type ExpertFinalizeImportInput = {
+  "items": Record<string, unknown>[];
+};
+
+export type ExpertModelPrediction = {
+  "model_version"?: string | null;
+  "meteorite_probability"?: number | null;
+  "decision_band"?: string | null;
+  "dominant_class"?: string | null;
+  "class_confidence"?: number | null;
+  "models"?: Record<string, unknown>;
+  "raw"?: Record<string, unknown>;
+};
+
+export type ExpertPresignUploadInput = {
+  "files": Record<string, unknown>[];
+};
+
+export type ExpertPresignUploadResponse = {
+  "uploads"?: ExpertPresignedUpload[];
+};
+
+export type ExpertPresignedUpload = {
+  "filename": string;
+  "object_key": string;
+  "upload_url": string;
+};
+
+export type ExpertQueueItemResponse = {
+  "item_id": string;
+  "dataset_id": string;
+  "status": string;
+  "image_url"?: string | null;
+  "thumbnail_url"?: string | null;
+  "original_filename"?: string | null;
+  "specimen_id"?: string | null;
+  "content_type": string;
+  "quality_report"?: Record<string, unknown> | null;
+  "metadata"?: Record<string, unknown>;
+  "prediction"?: ExpertModelPrediction | null;
+  "lease_expires_at"?: string | null;
+  "model_version"?: string;
+  "taxonomy_version"?: string;
+  "annotation_policy_version"?: string;
+  "dataset_version"?: string | null;
 };
 
 export type HealthResponse = {
@@ -526,6 +678,7 @@ export type ApiSchemas = {
   "AuthUserResponse": AuthUserResponse;
   "BillingCheckoutInput": BillingCheckoutInput;
   "BillingWebhookResponse": BillingWebhookResponse;
+  "Body_expert_upload_dataset_image_api_v1_expert_datasets__dataset_id__images_post": Body_expert_upload_dataset_image_api_v1_expert_datasets__dataset_id__images_post;
   "Body_scan_exterior_api_v1_scan_exterior_post": Body_scan_exterior_api_v1_scan_exterior_post;
   "Body_scan_interior_update_api_v1_scan__scan_id__interior_patch": Body_scan_interior_update_api_v1_scan__scan_id__interior_patch;
   "Body_upload_capture_session_image_api_v1_scan_capture_sessions__session_id__images_post": Body_upload_capture_session_image_api_v1_scan_capture_sessions__session_id__images_post;
@@ -535,6 +688,21 @@ export type ApiSchemas = {
   "CheckoutSessionResponse": CheckoutSessionResponse;
   "CollectionItemResponse": CollectionItemResponse;
   "CreateMessageInput": CreateMessageInput;
+  "ExpertAnnotationInput": ExpertAnnotationInput;
+  "ExpertAnnotationResponse": ExpertAnnotationResponse;
+  "ExpertAuditCreateInput": ExpertAuditCreateInput;
+  "ExpertAuditResponse": ExpertAuditResponse;
+  "ExpertDatasetCreateInput": ExpertDatasetCreateInput;
+  "ExpertDatasetResponse": ExpertDatasetResponse;
+  "ExpertDatasetStatsResponse": ExpertDatasetStatsResponse;
+  "ExpertExportCreateInput": ExpertExportCreateInput;
+  "ExpertExportResponse": ExpertExportResponse;
+  "ExpertFinalizeImportInput": ExpertFinalizeImportInput;
+  "ExpertModelPrediction": ExpertModelPrediction;
+  "ExpertPresignUploadInput": ExpertPresignUploadInput;
+  "ExpertPresignUploadResponse": ExpertPresignUploadResponse;
+  "ExpertPresignedUpload": ExpertPresignedUpload;
+  "ExpertQueueItemResponse": ExpertQueueItemResponse;
   "HealthResponse": HealthResponse;
   "InvoiceResponse": InvoiceResponse;
   "LoginInput": LoginInput;

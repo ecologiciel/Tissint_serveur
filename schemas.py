@@ -506,3 +506,159 @@ class ScanMetadataInput(BaseModel):
         if not v.isalnum() and "_" not in v and "-" not in v:
             raise ValueError("L'ID utilisateur contient des caractères non autorisés.")
         return v
+
+
+class ExpertDatasetCreateInput(BaseModel):
+    name: str = Field(..., min_length=2, max_length=160)
+    description: Optional[str] = Field(None, max_length=1000)
+    taxonomy_version: str = Field("taxonomy-v1", min_length=1, max_length=80)
+    annotation_policy_version: str = Field("annotation-policy-v1", min_length=1, max_length=80)
+
+
+class ExpertAccountCreateInput(BaseModel):
+    first_name: str = Field(..., min_length=1, max_length=80)
+    last_name: str = Field(..., min_length=1, max_length=80)
+    phone: str = Field(..., min_length=5, max_length=40)
+    email: Optional[str] = Field(None, max_length=120)
+    password: str = Field(..., min_length=8, max_length=200)
+
+
+class ExpertAccountResponse(BaseModel):
+    user: AuthUserResponse
+    permissions: List[str] = Field(default_factory=lambda: ["dataset.read", "dataset.annotate"])
+
+
+class ExpertDatasetResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    status: str
+    taxonomy_version: str
+    annotation_policy_version: str
+    statistics: dict = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+    model_version: str = "trio-v1"
+
+
+class ExpertPresignUploadInput(BaseModel):
+    files: List[dict]
+
+
+class ExpertPresignedUpload(BaseModel):
+    filename: str
+    object_key: str
+    upload_url: str
+
+
+class ExpertPresignUploadResponse(BaseModel):
+    uploads: List[ExpertPresignedUpload] = Field(default_factory=list)
+
+
+class ExpertFinalizeImportInput(BaseModel):
+    items: List[dict]
+
+
+class ExpertDatasetStatsResponse(BaseModel):
+    dataset_id: str
+    counts: dict = Field(default_factory=dict)
+    label_counts: dict = Field(default_factory=dict)
+    quality_counts: dict = Field(default_factory=dict)
+    last_audit_id: Optional[str] = None
+    model_version: str = "trio-v1"
+    taxonomy_version: str = "taxonomy-v1"
+    annotation_policy_version: str = "annotation-policy-v1"
+    dataset_version: Optional[str] = None
+
+
+class ExpertModelPrediction(BaseModel):
+    model_version: Optional[str] = None
+    meteorite_probability: Optional[float] = None
+    decision_band: Optional[str] = None
+    dominant_class: Optional[str] = None
+    class_confidence: Optional[float] = None
+    models: dict = Field(default_factory=dict)
+    raw: dict = Field(default_factory=dict)
+
+
+class ExpertQueueItemResponse(BaseModel):
+    item_id: str
+    dataset_id: str
+    status: str
+    image_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    original_filename: Optional[str] = None
+    specimen_id: Optional[str] = None
+    content_type: str
+    quality_report: Optional[dict] = None
+    metadata: dict = Field(default_factory=dict)
+    prediction: Optional[ExpertModelPrediction] = None
+    lease_expires_at: Optional[str] = None
+    model_version: str = "trio-v1"
+    taxonomy_version: str = "taxonomy-v1"
+    annotation_policy_version: str = "annotation-policy-v1"
+    dataset_version: Optional[str] = None
+
+
+class ExpertAnnotationInput(BaseModel):
+    client_uuid: str = Field(..., min_length=8, max_length=120)
+    action: Literal["label", "skip", "unusable", "review"]
+    top_label: Optional[Literal["meteorite", "terrestrial_rock", "uncertain", "unusable", "non_rock"]] = None
+    meteorite_subclass: Optional[str] = Field(None, max_length=100)
+    terrestrial_family: Optional[str] = Field(None, max_length=100)
+    confidence: Optional[Literal["high", "medium", "low", "not_assessed"]] = None
+    comment: Optional[str] = Field(None, max_length=2000)
+    specimen_id: Optional[str] = Field(None, max_length=160)
+    metadata: dict = Field(default_factory=dict)
+
+
+class ExpertAnnotationResponse(BaseModel):
+    item: ExpertQueueItemResponse
+    annotation_id: str
+    consensus_status: str
+    review_required: bool
+    next_item_available: bool
+    model_version: str = "trio-v1"
+    taxonomy_version: str = "taxonomy-v1"
+    annotation_policy_version: str = "annotation-policy-v1"
+    dataset_version: Optional[str] = None
+
+
+class ExpertAuditCreateInput(BaseModel):
+    dataset_id: str = Field(..., min_length=8, max_length=120)
+    model_version: str = Field("trio-v1", min_length=1, max_length=80)
+
+
+class ExpertAuditResponse(BaseModel):
+    id: str
+    dataset_id: str
+    status: str
+    model_version: str
+    summary: dict = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+    report_url: Optional[str] = None
+    errors_url: Optional[str] = None
+    created_at: str
+    completed_at: Optional[str] = None
+    taxonomy_version: str = "taxonomy-v1"
+    annotation_policy_version: str = "annotation-policy-v1"
+    dataset_version: Optional[str] = None
+
+
+class ExpertExportCreateInput(BaseModel):
+    dataset_id: str = Field(..., min_length=8, max_length=120)
+    version: Optional[str] = Field(None, max_length=80)
+
+
+class ExpertExportResponse(BaseModel):
+    id: str
+    dataset_id: str
+    version: str
+    status: str
+    statistics: dict = Field(default_factory=dict)
+    manifest_url: Optional[str] = None
+    created_at: str
+    model_version: str = "trio-v1"
+    taxonomy_version: str = "taxonomy-v1"
+    annotation_policy_version: str = "annotation-policy-v1"
+    dataset_version: Optional[str] = None

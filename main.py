@@ -8,6 +8,8 @@ import re
 import hashlib
 import json
 import io
+import csv
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -73,6 +75,23 @@ from schemas import (
     WalletTransactionResponse,
     WithdrawInput,
     WithdrawResponse,
+    ExpertAnnotationInput,
+    ExpertAnnotationResponse,
+    ExpertAccountCreateInput,
+    ExpertAccountResponse,
+    ExpertAuditCreateInput,
+    ExpertAuditResponse,
+    ExpertDatasetCreateInput,
+    ExpertDatasetResponse,
+    ExpertDatasetStatsResponse,
+    ExpertExportCreateInput,
+    ExpertExportResponse,
+    ExpertFinalizeImportInput,
+    ExpertModelPrediction,
+    ExpertPresignUploadInput,
+    ExpertPresignUploadResponse,
+    ExpertPresignedUpload,
+    ExpertQueueItemResponse,
 )
 from security import create_token, hash_password, hash_token, verify_api_key, verify_password, validate_upload_file
 from app.services.notifier import send_telegram_radar_alert
@@ -112,6 +131,7 @@ from business_logic import (
 # Import database and storage components
 from database import (
     engine,
+    AsyncSessionLocal,
     Base,
     get_db,
     UserModel,
@@ -133,8 +153,27 @@ from database import (
     BillingCheckoutSessionModel,
     BillingEventModel,
     InvoiceModel,
+    DatasetBatchModel,
+    DatasetItemModel,
+    AnnotationEventModel,
+    DatasetConsensusModel,
+    AuditRunModel,
+    DatasetExportModel,
 )
 from storage import storage_provider, UPLOAD_DIR
+from expert_dataset import (
+    ANNOTATION_POLICY_VERSION,
+    MODEL_VERSION,
+    TAXONOMY_VERSION,
+    build_audit,
+    build_single_image_prediction,
+    image_quality_report,
+    normalize_image_assets,
+    perceptual_hash,
+    render_audit_html,
+    sha256_hex,
+    validate_annotation,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -532,7 +571,9 @@ def _normalize_phone(phone: str) -> str:
 
 def _quota_response(subscription, user: UserModel | None = None) -> QuotaResponse:
     subscription_state = subscription_payload(subscription)
-    role = subscription_state["role"]
+    role = user.role if user and user.role == "expert" else subscription_state["role"]
+    if role == "expert":
+        return QuotaResponse(role=role, daily_limit=0, remaining_today=0, resets_at=None)
     if is_unlimited_scan_user(user):
         return QuotaResponse(
             role=role,
@@ -554,13 +595,14 @@ def _subscription_response(subscription) -> SubscriptionResponse:
 
 def _auth_user_response(user: UserModel, subscription) -> AuthUserResponse:
     subscription_state = subscription_payload(subscription)
+    role = user.role if user.role == "expert" else subscription_state["role"]
     return AuthUserResponse(
         id=user.id,
         first_name=user.first_name,
         last_name=user.last_name,
         phone=user.phone,
         email=user.email,
-        role=subscription_state["role"],
+        role=role,
         premium_expires_at=(
             subscription.subscription_expires_at.isoformat()
             if subscription.subscription_expires_at
@@ -649,8 +691,20 @@ async def _require_admin_context(
     db: AsyncSession,
 ):
     user, _session, subscription, _token = await _current_auth_context(authorization, db)
-    if subscription.tier != "admin":
+    if user.role != "admin" and subscription.tier != "admin":
         raise AppProductionException("FORBIDDEN", "Acces admin requis.", 403)
+    return user, subscription
+
+
+async def _require_expert_context(
+    authorization: Optional[str],
+    db: AsyncSession,
+    require_review: bool = False,
+):
+    user, _session, subscription, _token = await _current_auth_context(authorization, db)
+    role = user.role
+    if role not in {"expert", "admin"} and subscription.tier != "admin":
+        raise AppProductionException("FORBIDDEN", "Acces expert requis.", 403)
     return user, subscription
 
 def _validate_mobile_user_id(user_id: str) -> str:
@@ -796,7 +850,6 @@ async def login(
         raise AppProductionException("UNAUTHORIZED", "Identifiants invalides.", 401)
 
     subscription = await get_or_create_subscription(user.id, db)
-    user.role = subscription.tier
     await db.commit()
     await db.refresh(user)
 
@@ -3722,3 +3775,1069 @@ async def get_chat_history(
         )
         for msg in messages
     ]
+
+
+# ---------------------------------------------------------------------------
+# Expert dataset workspace
+# ---------------------------------------------------------------------------
+
+DATASET_ALLOWED_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/tiff",
+    "image/heic",
+    "image/heif",
+}
+DATASET_MAX_FILE_SIZE_BYTES = int(os.getenv("DATASET_MAX_FILE_SIZE_BYTES", str(20 * 1024 * 1024)))
+DATASET_LEASE_MINUTES = int(os.getenv("DATASET_LEASE_MINUTES", "15"))
+
+
+def _dataset_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _dataset_response(batch: DatasetBatchModel) -> ExpertDatasetResponse:
+    return ExpertDatasetResponse(
+        id=batch.id,
+        name=batch.name,
+        description=batch.description,
+        status=batch.status,
+        taxonomy_version=batch.taxonomy_version,
+        annotation_policy_version=batch.annotation_policy_version,
+        statistics=batch.statistics or {},
+        created_at=batch.created_at.isoformat() if batch.created_at else "",
+        updated_at=batch.updated_at.isoformat() if batch.updated_at else "",
+    )
+
+
+def _normalize_dataset_image(data: bytes) -> tuple[bytes, bytes, dict]:
+    return normalize_image_assets(data)
+
+
+async def _dataset_object_url(object_key: Optional[str]) -> Optional[str]:
+    if not object_key:
+        return None
+    return await storage_provider.create_presigned_get(object_key)
+
+
+async def _dataset_item_response(item: DatasetItemModel) -> ExpertQueueItemResponse:
+    prediction = ExpertModelPrediction(**(item.raw_prediction or {})) if item.raw_prediction else None
+    return ExpertQueueItemResponse(
+        item_id=item.id,
+        dataset_id=item.batch_id,
+        status=item.status,
+        image_url=await _dataset_object_url(item.normalized_object_key or item.original_object_key),
+        thumbnail_url=await _dataset_object_url(item.thumbnail_object_key),
+        original_filename=item.original_filename,
+        specimen_id=item.specimen_id,
+        content_type=item.content_type,
+        quality_report=item.quality_report,
+        metadata=item.item_metadata or {},
+        prediction=prediction,
+        lease_expires_at=item.lease_expires_at.isoformat() if item.lease_expires_at else None,
+    )
+
+
+async def _require_dataset_admin(authorization: Optional[str], db: AsyncSession):
+    user, subscription = await _require_expert_context(authorization, db)
+    if user.role != "admin" and subscription.tier != "admin":
+        raise AppProductionException("FORBIDDEN", "Acces administrateur dataset requis.", 403)
+    return user, subscription
+
+
+async def _infer_dataset_item(item_id: str) -> None:
+    if vision_pipeline is None:
+        return
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(DatasetItemModel)
+            .where(
+                DatasetItemModel.id == item_id,
+                DatasetItemModel.status.in_({"inference_pending", "imported"}),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        item = result.scalar_one_or_none()
+        if not item:
+            return
+        item.status = "processing_inference"
+        item.updated_at = _dataset_now()
+        await db.commit()
+        try:
+            original_bytes = await storage_provider.get_object(item.original_object_key)
+            image_sha = item.sha256 or sha256_hex(original_bytes)
+            duplicate_result = await db.execute(
+                select(DatasetItemModel).where(
+                    DatasetItemModel.batch_id == item.batch_id,
+                    DatasetItemModel.sha256 == image_sha,
+                    DatasetItemModel.id != item.id,
+                )
+            )
+            duplicate = duplicate_result.scalar_one_or_none()
+            if duplicate:
+                item.sha256 = image_sha
+                item.status = "skipped"
+                item.item_metadata = {
+                    **(item.item_metadata or {}),
+                    "duplicate_of": duplicate.id,
+                }
+                item.updated_at = _dataset_now()
+                await db.commit()
+                return
+            image_phash = item.perceptual_hash or perceptual_hash(original_bytes)
+            perceptual_duplicate_result = await db.execute(
+                select(DatasetItemModel).where(
+                    DatasetItemModel.batch_id == item.batch_id,
+                    DatasetItemModel.perceptual_hash == image_phash,
+                    DatasetItemModel.id != item.id,
+                ).limit(1)
+            )
+            perceptual_duplicate = perceptual_duplicate_result.scalar_one_or_none()
+            item.perceptual_hash = image_phash
+            if perceptual_duplicate:
+                item.item_metadata = {
+                    **(item.item_metadata or {}),
+                    "perceptual_duplicate_of": perceptual_duplicate.id,
+                }
+            if not item.normalized_object_key:
+                normalized, thumbnail, quality = _normalize_dataset_image(original_bytes)
+                item.sha256 = image_sha
+                normalized_key = f"datasets/{item.batch_id}/normalized/{item.id}.jpg"
+                thumbnail_key = f"datasets/{item.batch_id}/thumbnails/{item.id}.jpg"
+                item.normalized_object_key = await storage_provider.save_object(
+                    normalized, normalized_key, "image/jpeg"
+                )
+                item.thumbnail_object_key = await storage_provider.save_object(
+                    thumbnail, thumbnail_key, "image/jpeg"
+                )
+                item.quality_report = quality
+                image_bytes = normalized
+            else:
+                image_bytes = await storage_provider.get_object(item.normalized_object_key)
+            raw_models = await anyio.to_thread.run_sync(
+                vision_pipeline.predict_image_parallel,
+                image_bytes,
+            )
+            item.raw_prediction = build_single_image_prediction(raw_models)
+            item.model_version = MODEL_VERSION
+            item.status = "pending_annotation"
+            item.updated_at = _dataset_now()
+            await db.commit()
+        except Exception as exc:
+            item.status = "inference_pending"
+            item.item_metadata = {
+                **(item.item_metadata or {}),
+                "inference_error": str(exc)[:500],
+            }
+            item.updated_at = _dataset_now()
+            await db.commit()
+
+
+async def _dataset_item_for_id(item_id: str, db: AsyncSession) -> DatasetItemModel:
+    result = await db.execute(select(DatasetItemModel).where(DatasetItemModel.id == item_id))
+    item = result.scalar_one_or_none()
+    if not item:
+        raise AppProductionException("NOT_FOUND", "Image dataset introuvable.", 404)
+    return item
+
+
+@app.post(
+    "/api/v1/admin/expert-accounts",
+    response_model=ExpertAccountResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def admin_create_expert_account(
+    payload: ExpertAccountCreateInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    admin, _subscription = await _require_admin_context(authorization, db)
+    phone = payload.phone.strip()
+    email = payload.email.strip() if payload.email else None
+    duplicate_query = select(UserModel).where(
+        or_(UserModel.phone == phone, UserModel.email == email if email else False)
+    )
+    duplicate_result = await db.execute(duplicate_query)
+    if duplicate_result.scalar_one_or_none():
+        raise AppProductionException("CONFLICT", "Un compte utilise déjà ce téléphone ou cet email.", 409)
+    user = UserModel(
+        id=str(uuid.uuid4()),
+        first_name=payload.first_name.strip(),
+        last_name=payload.last_name.strip(),
+        phone=phone,
+        email=email,
+        password_hash=hash_password(payload.password),
+        role="expert",
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    subscription = await get_or_create_subscription(user.id, db)
+    subscription.tier = "free"
+    subscription.remaining_tokens = 0
+    await db.commit()
+    await _write_audit_log(
+        db,
+        actor_user_id=admin.id,
+        action="admin_create_expert_account",
+        entity_type="user",
+        entity_id=user.id,
+        metadata={"permissions": ["dataset.read", "dataset.annotate"]},
+    )
+    await db.commit()
+    return ExpertAccountResponse(
+        user=AuthUserResponse(
+            id=user.id,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            phone=user.phone,
+            email=user.email,
+            role="expert",
+        ),
+    )
+
+
+@app.post(
+    "/api/v1/expert/datasets",
+    response_model=ExpertDatasetResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def expert_create_dataset(
+    payload: ExpertDatasetCreateInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_dataset_admin(authorization, db)
+    now = _dataset_now()
+    batch = DatasetBatchModel(
+        id=str(uuid.uuid4()),
+        name=payload.name.strip(),
+        description=payload.description,
+        status="active",
+        taxonomy_version=payload.taxonomy_version,
+        annotation_policy_version=payload.annotation_policy_version,
+        created_by=user.id,
+        statistics={},
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(batch)
+    await db.commit()
+    await db.refresh(batch)
+    return _dataset_response(batch)
+
+
+@app.get(
+    "/api/v1/expert/datasets",
+    response_model=List[ExpertDatasetResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_list_datasets(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    result = await db.execute(select(DatasetBatchModel).order_by(DatasetBatchModel.created_at.desc()))
+    return [_dataset_response(batch) for batch in result.scalars().all()]
+
+
+@app.get(
+    "/api/v1/expert/datasets/{dataset_id}",
+    response_model=ExpertDatasetResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_get_dataset(
+    dataset_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == dataset_id))
+    batch = result.scalar_one_or_none()
+    if not batch:
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    return _dataset_response(batch)
+
+
+@app.post(
+    "/api/v1/expert/datasets/{dataset_id}/images",
+    response_model=ExpertQueueItemResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def expert_upload_dataset_image(
+    dataset_id: str,
+    background_tasks: BackgroundTasks,
+    image: UploadFile = File(...),
+    specimen_id: Optional[str] = Form(None),
+    source_type: Optional[str] = Form(None),
+    origin: Optional[str] = Form(None),
+    capture_type: Optional[str] = Form(None),
+    has_interior_cut: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_dataset_admin(authorization, db)
+    batch_result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == dataset_id))
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    if image.content_type not in DATASET_ALLOWED_CONTENT_TYPES:
+        raise AppProductionException("INVALID_FILE_FORMAT", "Format image non supporté.", 415)
+    data = await image.read()
+    if len(data) > DATASET_MAX_FILE_SIZE_BYTES:
+        raise AppProductionException("FILE_TOO_LARGE", "Image dataset trop volumineuse.", 413)
+    try:
+        normalized, thumbnail, quality = _normalize_dataset_image(data)
+        image_sha = sha256_hex(data)
+        image_phash = perceptual_hash(data)
+    except Exception as exc:
+        raise AppProductionException("INVALID_IMAGE", f"Image illisible: {exc}", 415)
+
+    existing = await db.execute(
+        select(DatasetItemModel).where(
+            DatasetItemModel.batch_id == dataset_id,
+            DatasetItemModel.sha256 == image_sha,
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise AppProductionException("CONFLICT", "Cette image existe déjà dans le dataset.", 409)
+
+    item_id = str(uuid.uuid4())
+    raw_key = f"datasets/{dataset_id}/raw/{image_sha}/original"
+    normalized_key = f"datasets/{dataset_id}/normalized/{item_id}.jpg"
+    thumbnail_key = f"datasets/{dataset_id}/thumbnails/{item_id}.jpg"
+    raw_key = await storage_provider.save_object(data, raw_key, image.content_type)
+    normalized_key = await storage_provider.save_object(normalized, normalized_key, "image/jpeg")
+    thumbnail_key = await storage_provider.save_object(thumbnail, thumbnail_key, "image/jpeg")
+
+    metadata = {
+        "source_type": source_type or "unknown",
+        "origin": origin or "unknown",
+        "capture_type": capture_type or "unknown",
+        "has_interior_cut": has_interior_cut or "unknown",
+        "upload_filename": image.filename,
+    }
+    now = _dataset_now()
+    item = DatasetItemModel(
+        id=item_id,
+        batch_id=dataset_id,
+        specimen_id=specimen_id or None,
+        original_filename=image.filename,
+        content_type=image.content_type,
+        original_object_key=raw_key,
+        normalized_object_key=normalized_key,
+        thumbnail_object_key=thumbnail_key,
+        sha256=image_sha,
+        perceptual_hash=image_phash,
+        status="inference_pending",
+        quality_report=quality,
+        item_metadata=metadata,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    if vision_pipeline is not None:
+        background_tasks.add_task(_infer_dataset_item, item.id)
+    return await _dataset_item_response(item)
+
+
+@app.post(
+    "/api/v1/expert/datasets/{dataset_id}/presign-upload",
+    response_model=ExpertPresignUploadResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_presign_upload(
+    dataset_id: str,
+    payload: ExpertPresignUploadInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_dataset_admin(authorization, db)
+    if os.getenv("STORAGE_BACKEND", "local").strip().lower() != "s3":
+        raise AppProductionException(
+            "SERVICE_UNAVAILABLE",
+            "Les uploads présignés nécessitent STORAGE_BACKEND=s3.",
+            503,
+        )
+    result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == dataset_id))
+    if not result.scalar_one_or_none():
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    uploads = []
+    for file_spec in payload.files:
+        filename = os.path.basename(str(file_spec.get("filename") or "image.jpg"))
+        content_type = str(file_spec.get("content_type") or "image/jpeg")
+        if content_type not in DATASET_ALLOWED_CONTENT_TYPES:
+            raise AppProductionException("INVALID_FILE_FORMAT", "Format image non supporté.", 415)
+        object_key = f"datasets/{dataset_id}/uploads/{uuid.uuid4()}-{filename}"
+        upload_url = await storage_provider.create_presigned_put(object_key, content_type)
+        uploads.append(ExpertPresignedUpload(filename=filename, object_key=object_key, upload_url=upload_url))
+    return ExpertPresignUploadResponse(uploads=uploads)
+
+
+@app.post(
+    "/api/v1/expert/datasets/{dataset_id}/finalize-import",
+    response_model=ExpertDatasetResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_finalize_import(
+    dataset_id: str,
+    payload: ExpertFinalizeImportInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_dataset_admin(authorization, db)
+    result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == dataset_id))
+    batch = result.scalar_one_or_none()
+    if not batch:
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    now = _dataset_now()
+    created = 0
+    for spec in payload.items:
+        object_key = str(spec.get("object_key") or "").strip()
+        if not object_key:
+            continue
+        expected_prefix = f"datasets/{dataset_id}/uploads/"
+        if not object_key.startswith(expected_prefix):
+            raise AppProductionException("VALIDATION_ERROR", "Clé d’import dataset invalide.", 400)
+        content_type = str(spec.get("content_type") or "image/jpeg")
+        if content_type not in DATASET_ALLOWED_CONTENT_TYPES:
+            raise AppProductionException("INVALID_FILE_FORMAT", "Format image non supporté.", 415)
+        item = DatasetItemModel(
+            id=str(uuid.uuid4()),
+            batch_id=dataset_id,
+            specimen_id=spec.get("specimen_id") or None,
+            original_filename=os.path.basename(str(spec.get("filename") or object_key)),
+            content_type=content_type,
+            original_object_key=object_key,
+            status="inference_pending",
+            item_metadata={
+                "source_type": spec.get("source_type") or "unknown",
+                "origin": spec.get("origin") or "unknown",
+                "capture_type": spec.get("capture_type") or "unknown",
+                "has_interior_cut": spec.get("has_interior_cut") or "unknown",
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(item)
+        created += 1
+    batch.statistics = {**(batch.statistics or {}), "imported_items": created}
+    batch.updated_at = now
+    await db.commit()
+    await db.refresh(batch)
+    return _dataset_response(batch)
+
+
+@app.get(
+    "/api/v1/expert/datasets/{dataset_id}/stats",
+    response_model=ExpertDatasetStatsResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_dataset_stats(
+    dataset_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    batch_result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == dataset_id))
+    if not batch_result.scalar_one_or_none():
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    result = await db.execute(select(DatasetItemModel).where(DatasetItemModel.batch_id == dataset_id))
+    items = result.scalars().all()
+    counts = Counter(item.status for item in items)
+    quality_counts = Counter(
+        "passed" if (item.quality_report or {}).get("passed") else "flagged"
+        for item in items
+        if item.quality_report is not None
+    )
+    consensus_result = await db.execute(
+        select(DatasetConsensusModel).join(
+            DatasetItemModel,
+            DatasetConsensusModel.dataset_item_id == DatasetItemModel.id,
+        ).where(DatasetItemModel.batch_id == dataset_id)
+    )
+    label_counts = Counter(row.final_label or "unlabeled" for row in consensus_result.scalars().all())
+    audit_result = await db.execute(
+        select(AuditRunModel.id)
+        .where(AuditRunModel.batch_id == dataset_id)
+        .order_by(AuditRunModel.created_at.desc())
+        .limit(1)
+    )
+    return ExpertDatasetStatsResponse(
+        dataset_id=dataset_id,
+        counts=dict(counts),
+        label_counts=dict(label_counts),
+        quality_counts=dict(quality_counts),
+        last_audit_id=audit_result.scalar_one_or_none(),
+        dataset_version=dataset_id,
+    )
+
+
+@app.get(
+    "/api/v1/expert/queue/next",
+    response_model=Optional[ExpertQueueItemResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_queue_next(
+    dataset_id: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_expert_context(authorization, db)
+    now = _dataset_now()
+    available_statuses = {"pending_annotation", "needs_review", "inference_ready"}
+    query = select(DatasetItemModel).where(
+        DatasetItemModel.status.in_(available_statuses),
+        or_(DatasetItemModel.lease_expires_at.is_(None), DatasetItemModel.lease_expires_at < now),
+    )
+    if dataset_id:
+        query = query.where(DatasetItemModel.batch_id == dataset_id)
+    query = query.order_by(DatasetItemModel.created_at.asc()).limit(1).with_for_update(skip_locked=True)
+    result = await db.execute(query)
+    item = result.scalar_one_or_none()
+    if not item:
+        return None
+    item.status = "in_progress"
+    item.lease_user_id = user.id
+    item.lease_expires_at = now + timedelta(minutes=DATASET_LEASE_MINUTES)
+    item.updated_at = now
+    await db.commit()
+    await db.refresh(item)
+    return await _dataset_item_response(item)
+
+
+@app.get(
+    "/api/v1/expert/items/{item_id}",
+    response_model=ExpertQueueItemResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_get_item(
+    item_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    item = await _dataset_item_for_id(item_id, db)
+    return await _dataset_item_response(item)
+
+
+@app.post(
+    "/api/v1/expert/items/{item_id}/annotation",
+    response_model=ExpertAnnotationResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_annotate_item(
+    item_id: str,
+    payload: ExpertAnnotationInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_expert_context(authorization, db)
+    item = await _dataset_item_for_id(item_id, db)
+    now = _dataset_now()
+    if item.lease_user_id not in {None, user.id} and item.lease_expires_at and item.lease_expires_at > now:
+        raise AppProductionException("CONFLICT", "Cette image est verrouillée par un autre expert.", 409)
+    duplicate_result = await db.execute(
+        select(AnnotationEventModel).where(AnnotationEventModel.client_uuid == payload.client_uuid)
+    )
+    duplicate = duplicate_result.scalar_one_or_none()
+    if duplicate:
+        return ExpertAnnotationResponse(
+            item=await _dataset_item_response(item),
+            annotation_id=duplicate.id,
+            consensus_status="duplicate",
+            review_required=True,
+            next_item_available=True,
+        )
+
+    if payload.action in {"label", "review"}:
+        try:
+            validate_annotation(payload.top_label, payload.meteorite_subclass, payload.terrestrial_family)
+        except ValueError as exc:
+            raise AppProductionException("VALIDATION_ERROR", str(exc), 400)
+        if payload.confidence is None:
+            raise AppProductionException("VALIDATION_ERROR", "La confiance de l'expert est obligatoire.", 400)
+
+    event = AnnotationEventModel(
+        id=str(uuid.uuid4()),
+        dataset_item_id=item.id,
+        expert_id=user.id,
+        client_uuid=payload.client_uuid,
+        action=payload.action,
+        top_label=payload.top_label,
+        meteorite_subclass=payload.meteorite_subclass,
+        terrestrial_family=payload.terrestrial_family,
+        confidence=payload.confidence,
+        comment=payload.comment,
+        annotation_metadata={
+            **payload.metadata,
+            "specimen_id": payload.specimen_id,
+        },
+        policy_version=ANNOTATION_POLICY_VERSION,
+        created_at=now,
+    )
+    db.add(event)
+
+    if payload.specimen_id is not None:
+        item.specimen_id = payload.specimen_id or None
+    if payload.metadata:
+        item.item_metadata = {**(item.item_metadata or {}), **payload.metadata}
+
+    consensus_result = await db.execute(
+        select(DatasetConsensusModel).where(DatasetConsensusModel.dataset_item_id == item.id)
+    )
+    consensus = consensus_result.scalar_one_or_none()
+    if not consensus:
+        consensus = DatasetConsensusModel(dataset_item_id=item.id, status="pending")
+        db.add(consensus)
+
+    annotation_result = await db.execute(
+        select(AnnotationEventModel).where(
+            AnnotationEventModel.dataset_item_id == item.id,
+            AnnotationEventModel.action.in_(["label", "review"]),
+        )
+    )
+    annotations = annotation_result.scalars().all()
+    annotations = [*annotations, event]
+    review_required = (
+        payload.action in {"skip", "review"}
+        or payload.top_label in {"meteorite", "uncertain"}
+        or payload.confidence in {"low", "not_assessed"}
+        or bool((item.quality_report or {}).get("issues"))
+        or len(annotations) < 2 and payload.top_label == "meteorite"
+    )
+    if len(annotations) >= 2:
+        first = annotations[0]
+        same = all(
+            annotation.top_label == first.top_label
+            and annotation.meteorite_subclass == first.meteorite_subclass
+            and annotation.terrestrial_family == first.terrestrial_family
+            for annotation in annotations
+        )
+        review_required = not same
+        if same:
+            consensus.final_label = first.top_label
+            consensus.meteorite_subclass = first.meteorite_subclass
+            consensus.terrestrial_family = first.terrestrial_family
+            consensus.status = "consensus_validated"
+            consensus.finalized_by = user.id
+            consensus.finalized_at = now
+    elif not review_required and payload.action == "label":
+        consensus.final_label = payload.top_label
+        consensus.meteorite_subclass = payload.meteorite_subclass
+        consensus.terrestrial_family = payload.terrestrial_family
+        consensus.status = "consensus_validated"
+        consensus.finalized_by = user.id
+        consensus.finalized_at = now
+
+    if payload.action == "skip":
+        item.status = "skipped"
+        consensus.status = "skipped"
+    elif payload.action == "unusable":
+        item.status = "unusable"
+        consensus.final_label = "unusable"
+        consensus.status = "consensus_validated"
+        consensus.finalized_by = user.id
+        consensus.finalized_at = now
+    elif consensus.status == "consensus_validated":
+        item.status = "consensus_validated"
+    else:
+        item.status = "needs_review" if review_required else "annotated"
+
+    consensus.review_required = review_required
+    consensus.annotation_count = len(annotations)
+    consensus.updated_at = now
+    item.lease_user_id = None
+    item.lease_expires_at = None
+    item.updated_at = now
+    await db.commit()
+    await db.refresh(item)
+    return ExpertAnnotationResponse(
+        item=await _dataset_item_response(item),
+        annotation_id=event.id,
+        consensus_status=consensus.status,
+        review_required=review_required,
+        next_item_available=True,
+    )
+
+
+@app.post(
+    "/api/v1/expert/items/{item_id}/release",
+    response_model=ExpertQueueItemResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_release_item(
+    item_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_expert_context(authorization, db)
+    item = await _dataset_item_for_id(item_id, db)
+    if item.lease_user_id not in {None, user.id} and user.role != "admin":
+        raise AppProductionException("FORBIDDEN", "Cette image appartient à un autre expert.", 403)
+    item.lease_user_id = None
+    item.lease_expires_at = None
+    if item.status == "in_progress":
+        item.status = "needs_review" if item.raw_prediction else "inference_pending"
+    item.updated_at = _dataset_now()
+    await db.commit()
+    await db.refresh(item)
+    return await _dataset_item_response(item)
+
+
+@app.post(
+    "/api/v1/expert/audits",
+    response_model=ExpertAuditResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def expert_create_audit(
+    payload: ExpertAuditCreateInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_dataset_admin(authorization, db)
+    result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == payload.dataset_id))
+    if not result.scalar_one_or_none():
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    rows_result = await db.execute(
+        select(DatasetItemModel, DatasetConsensusModel)
+        .join(DatasetConsensusModel, DatasetConsensusModel.dataset_item_id == DatasetItemModel.id)
+        .where(
+            DatasetItemModel.batch_id == payload.dataset_id,
+            DatasetConsensusModel.status == "consensus_validated",
+            DatasetItemModel.raw_prediction.is_not(None),
+        )
+    )
+    rows = rows_result.all()
+    summary, errors, recommendations = build_audit(rows)
+    audit_id = str(uuid.uuid4())
+    report_key = f"datasets/{payload.dataset_id}/reports/{audit_id}/summary.html"
+    errors_key = f"datasets/{payload.dataset_id}/reports/{audit_id}/errors.csv"
+    report_html = render_audit_html(summary, recommendations).encode("utf-8")
+    error_buffer = io.StringIO()
+    writer = csv.DictWriter(error_buffer, fieldnames=["item_id", "error_type", "score", "actual"])
+    writer.writeheader()
+    writer.writerows(errors)
+    await storage_provider.save_object(report_html, report_key, "text/html")
+    await storage_provider.save_object(error_buffer.getvalue().encode("utf-8"), errors_key, "text/csv")
+    now = _dataset_now()
+    audit = AuditRunModel(
+        id=audit_id,
+        batch_id=payload.dataset_id,
+        created_by=user.id,
+        status="completed",
+        model_version=payload.model_version,
+        summary=summary,
+        recommendations=recommendations,
+        report_object_key=report_key,
+        errors_object_key=errors_key,
+        created_at=now,
+        completed_at=now,
+    )
+    db.add(audit)
+    await db.commit()
+    return ExpertAuditResponse(
+        id=audit.id,
+        dataset_id=audit.batch_id,
+        status=audit.status,
+        model_version=audit.model_version,
+        summary=audit.summary or {},
+        recommendations=audit.recommendations or [],
+        report_url=await _dataset_object_url(audit.report_object_key),
+        errors_url=await _dataset_object_url(audit.errors_object_key),
+        created_at=audit.created_at.isoformat(),
+        completed_at=audit.completed_at.isoformat() if audit.completed_at else None,
+    )
+
+
+@app.get(
+    "/api/v1/expert/audits",
+    response_model=List[ExpertAuditResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_list_audits(
+    dataset_id: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    query = select(AuditRunModel).order_by(AuditRunModel.created_at.desc())
+    if dataset_id:
+        query = query.where(AuditRunModel.batch_id == dataset_id)
+    result = await db.execute(query)
+    return [
+        ExpertAuditResponse(
+            id=audit.id,
+            dataset_id=audit.batch_id,
+            status=audit.status,
+            model_version=audit.model_version,
+            summary=audit.summary or {},
+            recommendations=audit.recommendations or [],
+            report_url=await _dataset_object_url(audit.report_object_key),
+            errors_url=await _dataset_object_url(audit.errors_object_key),
+            created_at=audit.created_at.isoformat(),
+            completed_at=audit.completed_at.isoformat() if audit.completed_at else None,
+        )
+        for audit in result.scalars().all()
+    ]
+
+
+@app.get(
+    "/api/v1/expert/audits/{audit_id}",
+    response_model=ExpertAuditResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_get_audit(
+    audit_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    result = await db.execute(select(AuditRunModel).where(AuditRunModel.id == audit_id))
+    audit = result.scalar_one_or_none()
+    if not audit:
+        raise AppProductionException("NOT_FOUND", "Audit introuvable.", 404)
+    return ExpertAuditResponse(
+        id=audit.id,
+        dataset_id=audit.batch_id,
+        status=audit.status,
+        model_version=audit.model_version,
+        summary=audit.summary or {},
+        recommendations=audit.recommendations or [],
+        report_url=await _dataset_object_url(audit.report_object_key),
+        errors_url=await _dataset_object_url(audit.errors_object_key),
+        created_at=audit.created_at.isoformat(),
+        completed_at=audit.completed_at.isoformat() if audit.completed_at else None,
+    )
+
+
+@app.get(
+    "/api/v1/expert/audits/{audit_id}/download",
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_download_audit(
+    audit_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    result = await db.execute(select(AuditRunModel).where(AuditRunModel.id == audit_id))
+    audit = result.scalar_one_or_none()
+    if not audit:
+        raise AppProductionException("NOT_FOUND", "Audit introuvable.", 404)
+    return {
+        "audit_id": audit.id,
+        "summary_url": await _dataset_object_url(audit.report_object_key),
+        "errors_url": await _dataset_object_url(audit.errors_object_key),
+        "model_version": audit.model_version,
+        "taxonomy_version": TAXONOMY_VERSION,
+        "dataset_version": audit.batch_id,
+    }
+
+
+@app.post(
+    "/api/v1/expert/exports",
+    response_model=ExpertExportResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def expert_create_export(
+    payload: ExpertExportCreateInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_dataset_admin(authorization, db)
+    batch_result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == payload.dataset_id))
+    if not batch_result.scalar_one_or_none():
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    result = await db.execute(
+        select(DatasetItemModel, DatasetConsensusModel)
+        .join(DatasetConsensusModel, DatasetConsensusModel.dataset_item_id == DatasetItemModel.id)
+        .where(
+            DatasetItemModel.batch_id == payload.dataset_id,
+            DatasetConsensusModel.status == "consensus_validated",
+        )
+        .order_by(DatasetItemModel.created_at.asc())
+    )
+    rows = result.all()
+    if not rows:
+        raise AppProductionException("CONFLICT", "Aucune annotation validée à exporter.", 409)
+
+    version = payload.version or f"v{_dataset_now().strftime('%Y%m%d%H%M%S')}"
+    manifests: dict[str, list[dict]] = {"train": [], "validation": [], "test": []}
+    for item, consensus in rows:
+        specimen_key = item.specimen_id or item.id
+        split_hash = int(hashlib.sha256(specimen_key.encode("utf-8")).hexdigest()[:8], 16) % 100
+        split = "train" if split_hash < 80 else "validation" if split_hash < 90 else "test"
+        manifests[split].append({
+            "image_id": item.id,
+            "specimen_id": specimen_key,
+            "image_uri": item.normalized_object_key or item.original_object_key,
+            "sha256": item.sha256,
+            "top_label": consensus.final_label,
+            "meteorite_subclass": consensus.meteorite_subclass,
+            "terrestrial_family": consensus.terrestrial_family,
+            "quality": (item.quality_report or {}).get("passed", True),
+            "annotation_status": consensus.status,
+            "model_version": item.model_version,
+            "taxonomy_version": TAXONOMY_VERSION,
+            "split": split,
+        })
+
+    export_id = str(uuid.uuid4())
+    base_key = f"datasets/{payload.dataset_id}/exports/{version}"
+    manifest = [entry for split in ("train", "validation", "test") for entry in manifests[split]]
+    await storage_provider.save_object(
+        ("\n".join(json.dumps(item, ensure_ascii=False) for item in manifest) + "\n").encode("utf-8"),
+        f"{base_key}/manifest.jsonl",
+        "application/jsonl",
+    )
+    for split, entries in manifests.items():
+        await storage_provider.save_object(
+            ("\n".join(json.dumps(item, ensure_ascii=False) for item in entries) + "\n").encode("utf-8"),
+            f"{base_key}/{split}.jsonl",
+            "application/jsonl",
+        )
+    statistics = {"total": len(manifest), **{split: len(entries) for split, entries in manifests.items()}}
+    export = DatasetExportModel(
+        id=export_id,
+        batch_id=payload.dataset_id,
+        version=version,
+        status="completed",
+        created_by=user.id,
+        manifest_object_key=f"{base_key}/manifest.jsonl",
+        statistics=statistics,
+        created_at=_dataset_now(),
+    )
+    db.add(export)
+    await db.commit()
+    return ExpertExportResponse(
+        id=export.id,
+        dataset_id=export.batch_id,
+        version=export.version,
+        status=export.status,
+        statistics=statistics,
+        manifest_url=await _dataset_object_url(export.manifest_object_key),
+        created_at=export.created_at.isoformat(),
+    )
+
+
+@app.get(
+    "/api/v1/expert/exports",
+    response_model=List[ExpertExportResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_list_exports(
+    dataset_id: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    query = select(DatasetExportModel).order_by(DatasetExportModel.created_at.desc())
+    if dataset_id:
+        query = query.where(DatasetExportModel.batch_id == dataset_id)
+    result = await db.execute(query)
+    return [
+        ExpertExportResponse(
+            id=export.id,
+            dataset_id=export.batch_id,
+            version=export.version,
+            status=export.status,
+            statistics=export.statistics or {},
+            manifest_url=await _dataset_object_url(export.manifest_object_key),
+            created_at=export.created_at.isoformat(),
+        )
+        for export in result.scalars().all()
+    ]
+
+
+@app.get(
+    "/api/v1/expert/exports/{export_id}",
+    response_model=ExpertExportResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_get_export(
+    export_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    result = await db.execute(select(DatasetExportModel).where(DatasetExportModel.id == export_id))
+    export = result.scalar_one_or_none()
+    if not export:
+        raise AppProductionException("NOT_FOUND", "Export introuvable.", 404)
+    return ExpertExportResponse(
+        id=export.id,
+        dataset_id=export.batch_id,
+        version=export.version,
+        status=export.status,
+        statistics=export.statistics or {},
+        manifest_url=await _dataset_object_url(export.manifest_object_key),
+        created_at=export.created_at.isoformat(),
+    )
+
+
+@app.get(
+    "/api/v1/expert/exports/{export_id}/download",
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_download_export(
+    export_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    result = await db.execute(select(DatasetExportModel).where(DatasetExportModel.id == export_id))
+    export = result.scalar_one_or_none()
+    if not export:
+        raise AppProductionException("NOT_FOUND", "Export introuvable.", 404)
+    return {
+        "export_id": export.id,
+        "version": export.version,
+        "manifest_url": await _dataset_object_url(export.manifest_object_key),
+        "statistics": export.statistics or {},
+        "taxonomy_version": TAXONOMY_VERSION,
+        "dataset_version": export.batch_id,
+    }
