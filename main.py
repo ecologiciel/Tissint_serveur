@@ -310,9 +310,8 @@ def _now_naive_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _read_stored_file_bytes(stored_path: str) -> bytes:
-    with open(stored_path, "rb") as handle:
-        return handle.read()
+async def _read_stored_file_bytes(stored_path: str) -> bytes:
+    return await storage_provider.get_object(stored_path)
 
 
 def _compute_laplacian_like_variance(gray: "Any") -> float:
@@ -1776,9 +1775,9 @@ async def submit_capture_session(
     if vision_pipeline is None:
         raise AppProductionException("SERVICE_UNAVAILABLE", "Pipeline IA indisponible.", 503)
 
-    list_exterior_bytes = [_read_stored_file_bytes(path) for path in exterior_paths]
+    list_exterior_bytes = [await _read_stored_file_bytes(path) for path in exterior_paths]
     interior_path = _session_interior_path(session)
-    interior_bytes = _read_stored_file_bytes(interior_path) if interior_path else None
+    interior_bytes = await _read_stored_file_bytes(interior_path) if interior_path else None
 
     try:
         vision_results = await anyio.to_thread.run_sync(
@@ -4773,7 +4772,8 @@ async def expert_annotate_item(
         )
     )
     annotations = annotation_result.scalars().all()
-    annotations = [*annotations, event]
+    if not any(annotation.id == event.id for annotation in annotations):
+        annotations.append(event)
     review_required = (
         payload.action in {"skip", "review"}
         or payload.top_label in {"meteorite", "uncertain"}

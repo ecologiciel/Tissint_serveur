@@ -335,6 +335,7 @@ async def seed_marketplace_priority_pair(user_id: str, marker: str) -> tuple[str
                 exterior_images_paths=["storage/test/plain.jpg"],
             )
         )
+        await db.flush()
         db.add(
             ListingModel(
                 id=boosted_listing_id,
