@@ -4826,6 +4826,11 @@ async def expert_annotate_item(
             payload.top_label not in {"uncertain", "unusable"}
             and not (item.quality_report or {}).get("issues")
         )
+    elif review_required:
+        consensus.status = "needs_review"
+        consensus.final_label = None
+        consensus.meteorite_subclass = None
+        consensus.terrestrial_family = None
 
     if payload.action == "skip":
         item.status = "skipped"
