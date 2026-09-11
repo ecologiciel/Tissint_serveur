@@ -541,7 +541,37 @@ class ExpertDatasetResponse(BaseModel):
     model_version: str = "trio-v1"
 
 
+class ExpertImportCreateInput(BaseModel):
+    name: str = Field(..., min_length=1, max_length=160)
+    source_attested: bool = False
+
+
+class ExpertImportResponse(BaseModel):
+    id: str
+    dataset_id: str
+    name: str
+    status: str
+    source_attested: bool
+    statistics: dict = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
+class ExpertRoleUpdateInput(BaseModel):
+    role: Literal["free", "premium", "expert"]
+
+
+class ExpertUserResponse(BaseModel):
+    id: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: str
+    email: Optional[str] = None
+    role: str
+
+
 class ExpertPresignUploadInput(BaseModel):
+    import_id: Optional[str] = Field(None, max_length=120)
     files: List[dict]
 
 
@@ -556,6 +586,7 @@ class ExpertPresignUploadResponse(BaseModel):
 
 
 class ExpertFinalizeImportInput(BaseModel):
+    import_id: Optional[str] = Field(None, max_length=120)
     items: List[dict]
 
 
@@ -598,6 +629,11 @@ class ExpertQueueItemResponse(BaseModel):
     taxonomy_version: str = "taxonomy-v1"
     annotation_policy_version: str = "annotation-policy-v1"
     dataset_version: Optional[str] = None
+    import_id: Optional[str] = None
+    queue_reason: Optional[str] = None
+    review_stage: str = "primary"
+    consensus_status: Optional[str] = None
+    training_eligible: bool = False
 
 
 class ExpertAnnotationInput(BaseModel):
@@ -622,6 +658,17 @@ class ExpertAnnotationResponse(BaseModel):
     taxonomy_version: str = "taxonomy-v1"
     annotation_policy_version: str = "annotation-policy-v1"
     dataset_version: Optional[str] = None
+
+
+class ExpertAdjudicationInput(BaseModel):
+    client_uuid: str = Field(..., min_length=8, max_length=120)
+    top_label: Literal["meteorite", "terrestrial_rock", "uncertain", "unusable", "non_rock"]
+    meteorite_subclass: Optional[str] = Field(None, max_length=100)
+    terrestrial_family: Optional[str] = Field(None, max_length=100)
+    confidence: Literal["high"] = "high"
+    comment: Optional[str] = Field(None, max_length=2000)
+    specimen_id: Optional[str] = Field(None, max_length=160)
+    metadata: dict = Field(default_factory=dict)
 
 
 class ExpertAuditCreateInput(BaseModel):
@@ -657,6 +704,7 @@ class ExpertExportResponse(BaseModel):
     status: str
     statistics: dict = Field(default_factory=dict)
     manifest_url: Optional[str] = None
+    download_url: Optional[str] = None
     created_at: str
     model_version: str = "trio-v1"
     taxonomy_version: str = "taxonomy-v1"

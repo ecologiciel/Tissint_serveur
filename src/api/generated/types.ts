@@ -106,6 +106,7 @@ export type Body_expert_upload_dataset_image_api_v1_expert_datasets__dataset_id_
   "origin"?: string | null;
   "capture_type"?: string | null;
   "has_interior_cut"?: string | null;
+  "import_id"?: string | null;
 };
 
 export type Body_scan_exterior_api_v1_scan_exterior_post = {
@@ -203,6 +204,30 @@ export type CreateMessageInput = {
   "text_content": string;
 };
 
+export type ExpertAccountCreateInput = {
+  "first_name": string;
+  "last_name": string;
+  "phone": string;
+  "email"?: string | null;
+  "password": string;
+};
+
+export type ExpertAccountResponse = {
+  "user": AuthUserResponse;
+  "permissions"?: string[];
+};
+
+export type ExpertAdjudicationInput = {
+  "client_uuid": string;
+  "top_label": "meteorite" | "terrestrial_rock" | "uncertain" | "unusable" | "non_rock";
+  "meteorite_subclass"?: string | null;
+  "terrestrial_family"?: string | null;
+  "confidence"?: string;
+  "comment"?: string | null;
+  "specimen_id"?: string | null;
+  "metadata"?: Record<string, unknown>;
+};
+
 export type ExpertAnnotationInput = {
   "client_uuid": string;
   "action": "label" | "skip" | "unusable" | "review";
@@ -292,6 +317,7 @@ export type ExpertExportResponse = {
   "status": string;
   "statistics"?: Record<string, unknown>;
   "manifest_url"?: string | null;
+  "download_url"?: string | null;
   "created_at": string;
   "model_version"?: string;
   "taxonomy_version"?: string;
@@ -300,7 +326,24 @@ export type ExpertExportResponse = {
 };
 
 export type ExpertFinalizeImportInput = {
+  "import_id"?: string | null;
   "items": Record<string, unknown>[];
+};
+
+export type ExpertImportCreateInput = {
+  "name": string;
+  "source_attested"?: boolean;
+};
+
+export type ExpertImportResponse = {
+  "id": string;
+  "dataset_id": string;
+  "name": string;
+  "status": string;
+  "source_attested": boolean;
+  "statistics"?: Record<string, unknown>;
+  "created_at": string;
+  "updated_at": string;
 };
 
 export type ExpertModelPrediction = {
@@ -314,6 +357,7 @@ export type ExpertModelPrediction = {
 };
 
 export type ExpertPresignUploadInput = {
+  "import_id"?: string | null;
   "files": Record<string, unknown>[];
 };
 
@@ -344,6 +388,24 @@ export type ExpertQueueItemResponse = {
   "taxonomy_version"?: string;
   "annotation_policy_version"?: string;
   "dataset_version"?: string | null;
+  "import_id"?: string | null;
+  "queue_reason"?: string | null;
+  "review_stage"?: string;
+  "consensus_status"?: string | null;
+  "training_eligible"?: boolean;
+};
+
+export type ExpertRoleUpdateInput = {
+  "role": "free" | "premium" | "expert";
+};
+
+export type ExpertUserResponse = {
+  "id": string;
+  "first_name"?: string | null;
+  "last_name"?: string | null;
+  "phone": string;
+  "email"?: string | null;
+  "role": string;
 };
 
 export type HealthResponse = {
@@ -688,6 +750,9 @@ export type ApiSchemas = {
   "CheckoutSessionResponse": CheckoutSessionResponse;
   "CollectionItemResponse": CollectionItemResponse;
   "CreateMessageInput": CreateMessageInput;
+  "ExpertAccountCreateInput": ExpertAccountCreateInput;
+  "ExpertAccountResponse": ExpertAccountResponse;
+  "ExpertAdjudicationInput": ExpertAdjudicationInput;
   "ExpertAnnotationInput": ExpertAnnotationInput;
   "ExpertAnnotationResponse": ExpertAnnotationResponse;
   "ExpertAuditCreateInput": ExpertAuditCreateInput;
@@ -698,11 +763,15 @@ export type ApiSchemas = {
   "ExpertExportCreateInput": ExpertExportCreateInput;
   "ExpertExportResponse": ExpertExportResponse;
   "ExpertFinalizeImportInput": ExpertFinalizeImportInput;
+  "ExpertImportCreateInput": ExpertImportCreateInput;
+  "ExpertImportResponse": ExpertImportResponse;
   "ExpertModelPrediction": ExpertModelPrediction;
   "ExpertPresignUploadInput": ExpertPresignUploadInput;
   "ExpertPresignUploadResponse": ExpertPresignUploadResponse;
   "ExpertPresignedUpload": ExpertPresignedUpload;
   "ExpertQueueItemResponse": ExpertQueueItemResponse;
+  "ExpertRoleUpdateInput": ExpertRoleUpdateInput;
+  "ExpertUserResponse": ExpertUserResponse;
   "HealthResponse": HealthResponse;
   "InvoiceResponse": InvoiceResponse;
   "LoginInput": LoginInput;

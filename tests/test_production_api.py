@@ -1,5 +1,6 @@
 import os
 import uuid
+import zipfile
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
@@ -22,7 +23,15 @@ from business_logic import (
     apply_interior_cut_score_policy,
 )
 from billing import PREMIUM_DAILY_SCAN_LIMIT, UNLIMITED_SCAN_LIMIT
-from database import AsyncSessionLocal, CollectionItemModel, ListingModel, ScanModel, UserModel, UserSubscription
+from database import (
+    AsyncSessionLocal,
+    CollectionItemModel,
+    DatasetItemModel,
+    ListingModel,
+    ScanModel,
+    UserModel,
+    UserSubscription,
+)
 from fusion_engine import MeteoriteFusionEngine
 import main as main_module
 from main import app
@@ -86,6 +95,42 @@ async def promote_user_to_admin(user_id: str) -> None:
         subscription.status = "active"
         subscription.remaining_tokens = PREMIUM_DAILY_SCAN_LIMIT
         await db.commit()
+
+
+async def prepare_expert_item_for_review(item_id: str) -> None:
+    async with AsyncSessionLocal() as db:
+        item = await db.get(DatasetItemModel, item_id)
+        assert item is not None
+        item.status = "inference_ready"
+        # This fixed high hash keeps the test outside the deterministic 10% calibration sample.
+        item.sha256 = "f" * 64
+        item.quality_report = {"passed": True, "issues": [], "score": 0.98}
+        item.raw_prediction = {
+            "model_version": "trio-v1",
+            "meteorite_probability": 0.91,
+            "decision_band": "strong_meteorite",
+            "dominant_class": "Chondrite",
+            "class_confidence": 0.93,
+            "models": {
+                "dinov2": {"meteorite_probability": 0.98, "dominant_class": "Chondrite", "class_confidence": 0.94},
+                "swin": {"meteorite_probability": 0.90, "dominant_class": "Chondrite", "class_confidence": 0.92},
+                "convnext": {"meteorite_probability": 0.76, "dominant_class": "Chondrite", "class_confidence": 0.91},
+            },
+            "raw": {},
+        }
+        item.item_metadata = {**(item.item_metadata or {}), "queue_priority": 10}
+        await db.commit()
+
+
+def expert_image_bytes() -> bytes:
+    image = Image.new("RGB", (800, 800), "#6f513d")
+    draw = ImageDraw.Draw(image)
+    for offset in range(0, 800, 32):
+        draw.line((offset, 0, 799 - offset, 799), fill="#d8b28a", width=5)
+        draw.line((0, offset, 799, 799 - offset), fill="#2b201b", width=3)
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=92)
+    return buffer.getvalue()
 
 
 async def set_remaining_tokens(user_id: str, tokens: int) -> None:
@@ -1401,6 +1446,188 @@ def test_admin_radar_requires_admin_and_writes_audit_log(client: TestClient):
     assert audit_response.status_code == 200, audit_response.text
     audit_actions = {entry["action"] for entry in audit_response.json()}
     assert "admin_reserve_listing" in audit_actions
+
+
+def test_expert_human_in_the_loop_roles_import_review_adjudication_and_export(client: TestClient):
+    admin_session = register_user(client, "expert-admin")
+    expert_session = register_user(client, "expert-reviewer")
+    regular_session = register_user(client, "expert-regular")
+    admin_id = admin_session["user"]["id"]
+    expert_id = expert_session["user"]["id"]
+    run_in_app_loop(client, promote_user_to_admin, admin_id)
+
+    admin_headers = api_headers(admin_session["access_token"])
+    expert_headers = api_headers(expert_session["access_token"])
+    regular_headers = api_headers(regular_session["access_token"])
+
+    assert client.get("/api/v1/admin/expert-users", headers=regular_headers).status_code == 403
+    role_response = client.patch(
+        f"/api/v1/admin/expert-users/{expert_id}/role",
+        headers=admin_headers,
+        json={"role": "expert"},
+    )
+    assert role_response.status_code == 200, role_response.text
+    assert role_response.json()["role"] == "expert"
+
+    forbidden_dataset = client.post(
+        "/api/v1/expert/datasets",
+        headers=expert_headers,
+        json={"name": "Expert must not create", "description": "role test"},
+    )
+    assert forbidden_dataset.status_code == 403
+
+    dataset_response = client.post(
+        "/api/v1/expert/datasets",
+        headers=admin_headers,
+        json={"name": f"HITL {unique_suffix()}", "description": "dataset CI Human-in-the-Loop"},
+    )
+    assert dataset_response.status_code == 201, dataset_response.text
+    dataset_id = dataset_response.json()["id"]
+
+    unattested = client.post(
+        f"/api/v1/expert/datasets/{dataset_id}/imports",
+        headers=admin_headers,
+        json={"name": "without-rights", "source_attested": False},
+    )
+    assert unattested.status_code == 400
+
+    import_response = client.post(
+        f"/api/v1/expert/datasets/{dataset_id}/imports",
+        headers=admin_headers,
+        json={"name": "field-batch", "source_attested": True},
+    )
+    assert import_response.status_code == 201, import_response.text
+    import_id = import_response.json()["id"]
+
+    corrupt_upload = client.post(
+        f"/api/v1/expert/datasets/{dataset_id}/images",
+        headers=admin_headers,
+        data={"import_id": import_id},
+        files={"image": ("corrupt.jpg", b"not-an-image", "image/jpeg")},
+    )
+    assert corrupt_upload.status_code == 415
+
+    upload_data = expert_image_bytes()
+    upload_response = client.post(
+        f"/api/v1/expert/datasets/{dataset_id}/images",
+        headers=admin_headers,
+        data={"import_id": import_id, "specimen_id": "specimen-ci-42", "origin": "test"},
+        files={"image": ("specimen.jpg", upload_data, "image/jpeg")},
+    )
+    assert upload_response.status_code == 201, upload_response.text
+    item_id = upload_response.json()["item_id"]
+    assert upload_response.json()["import_id"] == import_id
+
+    duplicate_upload = client.post(
+        f"/api/v1/expert/datasets/{dataset_id}/images",
+        headers=admin_headers,
+        data={"import_id": import_id},
+        files={"image": ("same-specimen.jpg", upload_data, "image/jpeg")},
+    )
+    assert duplicate_upload.status_code == 409
+
+    complete_import = client.post(
+        f"/api/v1/expert/imports/{import_id}/complete",
+        headers=admin_headers,
+    )
+    assert complete_import.status_code == 200, complete_import.text
+    assert complete_import.json()["statistics"]["uploaded"] == 1
+
+    run_in_app_loop(client, prepare_expert_item_for_review, item_id)
+    primary_queue = client.get(
+        "/api/v1/expert/queue/next",
+        headers=expert_headers,
+        params={"dataset_id": dataset_id},
+    )
+    assert primary_queue.status_code == 200, primary_queue.text
+    assert primary_queue.json()["item_id"] == item_id
+    assert primary_queue.json()["queue_reason"] == "model_disagreement"
+
+    primary_annotation = {
+        "client_uuid": f"expert-primary-{unique_suffix()}",
+        "action": "label",
+        "top_label": "meteorite",
+        "meteorite_subclass": "chondrite",
+        "confidence": "high",
+        "specimen_id": "specimen-ci-42",
+        "metadata": {"source": "ci"},
+    }
+    primary_result = client.post(
+        f"/api/v1/expert/items/{item_id}/annotation",
+        headers=expert_headers,
+        json=primary_annotation,
+    )
+    assert primary_result.status_code == 200, primary_result.text
+    assert primary_result.json()["consensus_status"] == "needs_review"
+
+    secondary_queue = client.get(
+        "/api/v1/expert/queue/next",
+        headers=admin_headers,
+        params={"dataset_id": dataset_id},
+    )
+    assert secondary_queue.status_code == 200, secondary_queue.text
+    assert secondary_queue.json()["item_id"] == item_id
+    secondary_result = client.post(
+        f"/api/v1/expert/items/{item_id}/annotation",
+        headers=admin_headers,
+        json={
+            "client_uuid": f"expert-secondary-{unique_suffix()}",
+            "action": "label",
+            "top_label": "terrestrial_rock",
+            "terrestrial_family": "basalt",
+            "confidence": "high",
+        },
+    )
+    assert secondary_result.status_code == 200, secondary_result.text
+    assert secondary_result.json()["consensus_status"] == "needs_review"
+
+    adjudication = {
+        "client_uuid": f"expert-adjudication-{unique_suffix()}",
+        "top_label": "meteorite",
+        "meteorite_subclass": "chondrite",
+        "confidence": "high",
+        "comment": "CI conflict arbitration",
+        "specimen_id": "specimen-ci-42",
+    }
+    adjudicated = client.post(
+        f"/api/v1/expert/items/{item_id}/adjudicate",
+        headers=admin_headers,
+        json=adjudication,
+    )
+    assert adjudicated.status_code == 200, adjudicated.text
+    assert adjudicated.json()["consensus_status"] == "consensus_validated"
+    assert adjudicated.json()["item"]["training_eligible"] is True
+
+    replayed_adjudication = client.post(
+        f"/api/v1/expert/items/{item_id}/adjudicate",
+        headers=admin_headers,
+        json=adjudication,
+    )
+    assert replayed_adjudication.status_code == 200, replayed_adjudication.text
+    assert replayed_adjudication.json()["annotation_id"] == adjudicated.json()["annotation_id"]
+
+    audit_response = client.post(
+        "/api/v1/expert/audits",
+        headers=admin_headers,
+        json={"dataset_id": dataset_id},
+    )
+    assert audit_response.status_code == 201, audit_response.text
+    assert audit_response.json()["summary"]["human_review"]["needs_adjudication"] == 0
+
+    export_response = client.post(
+        "/api/v1/expert/exports",
+        headers=admin_headers,
+        json={"dataset_id": dataset_id, "version": "ci-hitl-v1"},
+    )
+    assert export_response.status_code == 201, export_response.text
+    export_payload = export_response.json()
+    assert export_payload["statistics"]["supervised_total"] == 1
+    archive_response = client.get(export_payload["download_url"], headers=admin_headers)
+    assert archive_response.status_code == 200, archive_response.text
+    with zipfile.ZipFile(BytesIO(archive_response.content)) as archive:
+        names = set(archive.namelist())
+        assert {"manifest.jsonl", "annotations.csv", "checksums.sha256", "taxonomy.json", "dataset-card.md"} <= names
+        assert any(name.startswith("images/") for name in names)
 
 
 def test_ui_alignment_collection_and_marketplace_images(client: TestClient):

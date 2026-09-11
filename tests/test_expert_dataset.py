@@ -7,6 +7,7 @@ from PIL import Image
 from expert_dataset import (
     build_audit,
     build_single_image_prediction,
+    deterministic_group_split,
     image_quality_report,
     normalize_image_assets,
     perceptual_hash,
@@ -55,6 +56,14 @@ def test_prediction_keeps_model_level_outputs_and_fusion_band():
     assert prediction["decision_band"] == "strong_meteorite"
     assert prediction["dominant_class"] == "Metallique"
     assert set(prediction["models"]) == {"dinov2", "swin", "convnext"}
+
+
+def test_group_split_is_stable_and_never_separates_specimen_views():
+    first_view = deterministic_group_split("specimen-azrou-42")
+    second_view = deterministic_group_split("specimen-azrou-42")
+
+    assert first_view == second_view
+    assert first_view in {"train", "validation", "test"}
 
 
 def test_audit_reports_error_types_calibration_and_subgroups():

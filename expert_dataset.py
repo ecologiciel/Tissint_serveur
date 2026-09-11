@@ -46,6 +46,16 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def deterministic_group_split(group_id: str) -> str:
+    """Keep all views of the same specimen in one reproducible 70/15/15 split."""
+    split_hash = int(hashlib.sha256(group_id.encode("utf-8")).hexdigest()[:8], 16) % 100
+    if split_hash < 70:
+        return "train"
+    if split_hash < 85:
+        return "validation"
+    return "test"
+
+
 def perceptual_hash(data: bytes) -> str:
     with Image.open(io.BytesIO(data)) as raw_image:
         image = ImageOps.exif_transpose(raw_image).convert("L").resize((16, 16))

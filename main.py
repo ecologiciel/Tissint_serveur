@@ -9,13 +9,14 @@ import hashlib
 import json
 import io
 import csv
+import zipfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import case, or_, text
+from sqlalchemy import Integer, case, func, or_, text
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -84,6 +85,11 @@ from schemas import (
     ExpertDatasetCreateInput,
     ExpertDatasetResponse,
     ExpertDatasetStatsResponse,
+    ExpertImportCreateInput,
+    ExpertImportResponse,
+    ExpertRoleUpdateInput,
+    ExpertUserResponse,
+    ExpertAdjudicationInput,
     ExpertExportCreateInput,
     ExpertExportResponse,
     ExpertFinalizeImportInput,
@@ -154,6 +160,7 @@ from database import (
     BillingEventModel,
     InvoiceModel,
     DatasetBatchModel,
+    DatasetImportModel,
     DatasetItemModel,
     AnnotationEventModel,
     DatasetConsensusModel,
@@ -163,10 +170,13 @@ from database import (
 from storage import storage_provider, UPLOAD_DIR
 from expert_dataset import (
     ANNOTATION_POLICY_VERSION,
+    METEORITE_SUBCLASSES,
     MODEL_VERSION,
+    TERRESTRIAL_FAMILIES,
     TAXONOMY_VERSION,
     build_audit,
     build_single_image_prediction,
+    deterministic_group_split,
     image_quality_report,
     normalize_image_assets,
     perceptual_hash,
@@ -202,6 +212,10 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN DEFAULT FALSE"))
         await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS subscription_started_at TIMESTAMP"))
         await conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE dataset_items ADD COLUMN IF NOT EXISTS import_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE dataset_consensus ADD COLUMN IF NOT EXISTS training_eligible BOOLEAN DEFAULT FALSE"))
+        await conn.execute(text("ALTER TABLE dataset_consensus ADD COLUMN IF NOT EXISTS final_confidence VARCHAR"))
+        await conn.execute(text("ALTER TABLE dataset_exports ADD COLUMN IF NOT EXISTS archive_object_key VARCHAR"))
         await conn.execute(text("UPDATE user_subscriptions SET status = CASE WHEN tier IN ('premium', 'admin') THEN 'active' ELSE 'none' END WHERE status IS NULL"))
         await conn.execute(text("UPDATE user_subscriptions SET cancel_at_period_end = FALSE WHERE cancel_at_period_end IS NULL"))
         await conn.execute(text("UPDATE user_subscriptions SET updated_at = NOW() WHERE updated_at IS NULL"))
@@ -3821,7 +3835,46 @@ async def _dataset_object_url(object_key: Optional[str]) -> Optional[str]:
     return await storage_provider.create_presigned_get(object_key)
 
 
-async def _dataset_item_response(item: DatasetItemModel) -> ExpertQueueItemResponse:
+def _second_review_sample(item: DatasetItemModel) -> bool:
+    seed = item.sha256 or item.id
+    return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16) % 100 < 10
+
+
+def _queue_reason(item: DatasetItemModel) -> str:
+    if item.status == "needs_review":
+        return "human_review"
+    if (item.quality_report or {}).get("issues"):
+        return "quality_flag"
+    model_scores = [
+        float(model.get("meteorite_probability"))
+        for model in ((item.raw_prediction or {}).get("models") or {}).values()
+        if isinstance(model, dict) and model.get("meteorite_probability") is not None
+    ]
+    if len(model_scores) >= 2 and max(model_scores) - min(model_scores) >= 0.15:
+        return "model_disagreement"
+    probability = float((item.raw_prediction or {}).get("meteorite_probability") or 0.0)
+    if 0.45 <= probability < 0.85:
+        return "borderline_score"
+    if _second_review_sample(item):
+        return "calibration_sample"
+    return "standard"
+
+
+def _queue_priority(item: DatasetItemModel) -> int:
+    return {
+        "human_review": 0,
+        "model_disagreement": 10,
+        "borderline_score": 20,
+        "quality_flag": 30,
+        "calibration_sample": 40,
+        "standard": 50,
+    }[_queue_reason(item)]
+
+
+async def _dataset_item_response(
+    item: DatasetItemModel,
+    consensus: Optional[DatasetConsensusModel] = None,
+) -> ExpertQueueItemResponse:
     prediction = ExpertModelPrediction(**(item.raw_prediction or {})) if item.raw_prediction else None
     return ExpertQueueItemResponse(
         item_id=item.id,
@@ -3836,7 +3889,56 @@ async def _dataset_item_response(item: DatasetItemModel) -> ExpertQueueItemRespo
         metadata=item.item_metadata or {},
         prediction=prediction,
         lease_expires_at=item.lease_expires_at.isoformat() if item.lease_expires_at else None,
+        import_id=item.import_id,
+        queue_reason=_queue_reason(item),
+        review_stage="secondary" if item.status == "needs_review" else "primary",
+        consensus_status=consensus.status if consensus else None,
+        training_eligible=bool(consensus.training_eligible) if consensus else False,
     )
+
+
+async def _import_response(import_row: DatasetImportModel, db: AsyncSession) -> ExpertImportResponse:
+    items_result = await db.execute(
+        select(DatasetItemModel).where(DatasetItemModel.import_id == import_row.id)
+    )
+    items = items_result.scalars().all()
+    counts = Counter(item.status for item in items)
+    statistics = {
+        **(import_row.statistics or {}),
+        "uploaded": len(items),
+        "ready": counts.get("pending_annotation", 0),
+        "processing": counts.get("inference_pending", 0) + counts.get("processing_inference", 0),
+        "duplicates": counts.get("skipped", 0),
+        "errors": counts.get("error", 0),
+        "status_counts": dict(counts),
+    }
+    return ExpertImportResponse(
+        id=import_row.id,
+        dataset_id=import_row.batch_id,
+        name=import_row.name,
+        status=import_row.status,
+        source_attested=import_row.source_attested,
+        statistics=statistics,
+        created_at=import_row.created_at.isoformat() if import_row.created_at else "",
+        updated_at=import_row.updated_at.isoformat() if import_row.updated_at else "",
+    )
+
+
+async def _refresh_import_status(import_id: Optional[str], db: AsyncSession) -> None:
+    if not import_id:
+        return
+    import_row = await db.get(DatasetImportModel, import_id)
+    if not import_row:
+        return
+    result = await db.execute(
+        select(DatasetItemModel.status).where(DatasetItemModel.import_id == import_id)
+    )
+    statuses = list(result.scalars().all())
+    if statuses and not any(status in {"inference_pending", "processing_inference", "imported"} for status in statuses):
+        import_row.status = "ready"
+    elif statuses:
+        import_row.status = "processing"
+    import_row.updated_at = _dataset_now()
 
 
 async def _require_dataset_admin(authorization: Optional[str], db: AsyncSession):
@@ -3883,6 +3985,7 @@ async def _infer_dataset_item(item_id: str) -> None:
                     "duplicate_of": duplicate.id,
                 }
                 item.updated_at = _dataset_now()
+                await _refresh_import_status(item.import_id, db)
                 await db.commit()
                 return
             image_phash = item.perceptual_hash or perceptual_hash(original_bytes)
@@ -3922,7 +4025,12 @@ async def _infer_dataset_item(item_id: str) -> None:
             item.raw_prediction = build_single_image_prediction(raw_models)
             item.model_version = MODEL_VERSION
             item.status = "pending_annotation"
+            item.item_metadata = {
+                **(item.item_metadata or {}),
+                "queue_priority": _queue_priority(item),
+            }
             item.updated_at = _dataset_now()
+            await _refresh_import_status(item.import_id, db)
             await db.commit()
         except Exception as exc:
             item.status = "inference_pending"
@@ -3931,6 +4039,7 @@ async def _infer_dataset_item(item_id: str) -> None:
                 "inference_error": str(exc)[:500],
             }
             item.updated_at = _dataset_now()
+            await _refresh_import_status(item.import_id, db)
             await db.commit()
 
 
@@ -3997,6 +4106,100 @@ async def admin_create_expert_account(
             email=user.email,
             role="expert",
         ),
+    )
+
+
+@app.get(
+    "/api/v1/admin/expert-users",
+    response_model=List[ExpertUserResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def admin_list_expert_users(
+    query: Optional[str] = Query(None, max_length=120),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_dataset_admin(authorization, db)
+    statement = (
+        select(UserModel)
+        .where(UserModel.role != "admin")
+        .order_by(UserModel.created_at.desc())
+        .limit(50)
+    )
+    if query:
+        pattern = f"%{query.strip()}%"
+        statement = statement.where(
+            or_(
+                UserModel.first_name.ilike(pattern),
+                UserModel.last_name.ilike(pattern),
+                UserModel.email.ilike(pattern),
+                UserModel.phone.ilike(pattern),
+            )
+        )
+    result = await db.execute(statement)
+    return [
+        ExpertUserResponse(
+            id=user.id,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            phone=user.phone,
+            email=user.email,
+            role=user.role,
+        )
+        for user in result.scalars().all()
+    ]
+
+
+@app.patch(
+    "/api/v1/admin/expert-users/{user_id}/role",
+    response_model=ExpertUserResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def admin_update_expert_user_role(
+    user_id: str,
+    payload: ExpertRoleUpdateInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    admin, _subscription = await _require_dataset_admin(authorization, db)
+    user = await db.get(UserModel, user_id)
+    if not user:
+        raise AppProductionException("NOT_FOUND", "Utilisateur introuvable.", 404)
+    if user.role == "admin":
+        raise AppProductionException("FORBIDDEN", "Le rôle administrateur ne peut pas être modifié ici.", 403)
+    previous_role = user.role
+    user.role = payload.role
+    subscription = await get_or_create_subscription(user.id, db)
+    if payload.role == "expert":
+        subscription.tier = "free"
+        subscription.status = "none"
+        subscription.remaining_tokens = 0
+    elif payload.role == "premium":
+        subscription.tier = "premium"
+        subscription.status = "active"
+    else:
+        subscription.tier = "free"
+        subscription.status = "none"
+    await _write_audit_log(
+        db,
+        actor_user_id=admin.id,
+        action="admin_update_expert_role",
+        entity_type="user",
+        entity_id=user.id,
+        metadata={"from": previous_role, "to": payload.role},
+    )
+    await db.commit()
+    return ExpertUserResponse(
+        id=user.id,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        phone=user.phone,
+        email=user.email,
+        role=user.role,
     )
 
 
@@ -4069,6 +4272,105 @@ async def expert_get_dataset(
 
 
 @app.post(
+    "/api/v1/expert/datasets/{dataset_id}/imports",
+    response_model=ExpertImportResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=ERROR_RESPONSES,
+)
+async def expert_create_import(
+    dataset_id: str,
+    payload: ExpertImportCreateInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_dataset_admin(authorization, db)
+    batch = await db.get(DatasetBatchModel, dataset_id)
+    if not batch:
+        raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    if not payload.source_attested:
+        raise AppProductionException(
+            "VALIDATION_ERROR",
+            "L'attestation de droit d'utilisation des images est obligatoire.",
+            400,
+        )
+    now = _dataset_now()
+    import_row = DatasetImportModel(
+        id=str(uuid.uuid4()),
+        batch_id=dataset_id,
+        name=payload.name.strip(),
+        source_attested=True,
+        status="uploading",
+        created_by=user.id,
+        statistics={},
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(import_row)
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="expert_import_created",
+        entity_type="dataset_import",
+        entity_id=import_row.id,
+        metadata={"dataset_id": dataset_id, "name": import_row.name},
+    )
+    await db.commit()
+    return await _import_response(import_row, db)
+
+
+@app.get(
+    "/api/v1/expert/datasets/{dataset_id}/imports",
+    response_model=List[ExpertImportResponse],
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_list_imports(
+    dataset_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    await _require_expert_context(authorization, db)
+    result = await db.execute(
+        select(DatasetImportModel)
+        .where(DatasetImportModel.batch_id == dataset_id)
+        .order_by(DatasetImportModel.created_at.desc())
+    )
+    return [await _import_response(row, db) for row in result.scalars().all()]
+
+
+@app.post(
+    "/api/v1/expert/imports/{import_id}/complete",
+    response_model=ExpertImportResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_complete_import(
+    import_id: str,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_dataset_admin(authorization, db)
+    import_row = await db.get(DatasetImportModel, import_id)
+    if not import_row:
+        raise AppProductionException("NOT_FOUND", "Lot d'import introuvable.", 404)
+    import_row.status = "processing"
+    import_row.updated_at = _dataset_now()
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="expert_import_completed",
+        entity_type="dataset_import",
+        entity_id=import_row.id,
+        metadata={"dataset_id": import_row.batch_id},
+    )
+    await db.commit()
+    return await _import_response(import_row, db)
+
+
+@app.post(
     "/api/v1/expert/datasets/{dataset_id}/images",
     response_model=ExpertQueueItemResponse,
     status_code=status.HTTP_201_CREATED,
@@ -4083,6 +4385,7 @@ async def expert_upload_dataset_image(
     origin: Optional[str] = Form(None),
     capture_type: Optional[str] = Form(None),
     has_interior_cut: Optional[str] = Form(None),
+    import_id: Optional[str] = Form(None),
     authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
     api_key: str = Depends(verify_api_key),
@@ -4092,6 +4395,13 @@ async def expert_upload_dataset_image(
     batch = batch_result.scalar_one_or_none()
     if not batch:
         raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    import_row = None
+    if import_id:
+        import_row = await db.get(DatasetImportModel, import_id)
+        if not import_row or import_row.batch_id != dataset_id:
+            raise AppProductionException("VALIDATION_ERROR", "Lot d'import dataset invalide.", 400)
+        if not import_row.source_attested:
+            raise AppProductionException("FORBIDDEN", "L'import doit être attesté avant envoi.", 403)
     if image.content_type not in DATASET_ALLOWED_CONTENT_TYPES:
         raise AppProductionException("INVALID_FILE_FORMAT", "Format image non supporté.", 415)
     data = await image.read()
@@ -4111,6 +4421,13 @@ async def expert_upload_dataset_image(
         )
     )
     if existing.scalar_one_or_none():
+        if import_row:
+            import_row.statistics = {
+                **(import_row.statistics or {}),
+                "duplicate_uploads": int((import_row.statistics or {}).get("duplicate_uploads", 0)) + 1,
+            }
+            import_row.updated_at = _dataset_now()
+            await db.commit()
         raise AppProductionException("CONFLICT", "Cette image existe déjà dans le dataset.", 409)
 
     item_id = str(uuid.uuid4())
@@ -4132,6 +4449,7 @@ async def expert_upload_dataset_image(
     item = DatasetItemModel(
         id=item_id,
         batch_id=dataset_id,
+        import_id=import_id or None,
         specimen_id=specimen_id or None,
         original_filename=image.filename,
         content_type=image.content_type,
@@ -4147,6 +4465,8 @@ async def expert_upload_dataset_image(
         updated_at=now,
     )
     db.add(item)
+    if import_row:
+        import_row.updated_at = now
     await db.commit()
     await db.refresh(item)
     if vision_pipeline is not None:
@@ -4177,6 +4497,10 @@ async def expert_presign_upload(
     result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == dataset_id))
     if not result.scalar_one_or_none():
         raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    if payload.import_id:
+        import_row = await db.get(DatasetImportModel, payload.import_id)
+        if not import_row or import_row.batch_id != dataset_id or not import_row.source_attested:
+            raise AppProductionException("VALIDATION_ERROR", "Lot d'import dataset invalide.", 400)
     uploads = []
     for file_spec in payload.files:
         filename = os.path.basename(str(file_spec.get("filename") or "image.jpg"))
@@ -4207,6 +4531,11 @@ async def expert_finalize_import(
     batch = result.scalar_one_or_none()
     if not batch:
         raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
+    import_row = None
+    if payload.import_id:
+        import_row = await db.get(DatasetImportModel, payload.import_id)
+        if not import_row or import_row.batch_id != dataset_id or not import_row.source_attested:
+            raise AppProductionException("VALIDATION_ERROR", "Lot d'import dataset invalide.", 400)
     now = _dataset_now()
     created = 0
     for spec in payload.items:
@@ -4222,6 +4551,7 @@ async def expert_finalize_import(
         item = DatasetItemModel(
             id=str(uuid.uuid4()),
             batch_id=dataset_id,
+            import_id=payload.import_id or None,
             specimen_id=spec.get("specimen_id") or None,
             original_filename=os.path.basename(str(spec.get("filename") or object_key)),
             content_type=content_type,
@@ -4239,6 +4569,9 @@ async def expert_finalize_import(
         db.add(item)
         created += 1
     batch.statistics = {**(batch.statistics or {}), "imported_items": created}
+    if import_row:
+        import_row.status = "processing"
+        import_row.updated_at = now
     batch.updated_at = now
     await db.commit()
     await db.refresh(batch)
@@ -4307,13 +4640,30 @@ async def expert_queue_next(
     user, _subscription = await _require_expert_context(authorization, db)
     now = _dataset_now()
     available_statuses = {"pending_annotation", "needs_review", "inference_ready"}
+    already_reviewed = (
+        select(AnnotationEventModel.id)
+        .where(
+            AnnotationEventModel.dataset_item_id == DatasetItemModel.id,
+            AnnotationEventModel.expert_id == user.id,
+            AnnotationEventModel.action.in_(["label", "review"]),
+        )
+        .exists()
+    )
+    queue_priority = func.coalesce(
+        DatasetItemModel.item_metadata["queue_priority"].astext.cast(Integer),
+        99,
+    )
     query = select(DatasetItemModel).where(
         DatasetItemModel.status.in_(available_statuses),
         or_(DatasetItemModel.lease_expires_at.is_(None), DatasetItemModel.lease_expires_at < now),
+        or_(DatasetItemModel.status != "needs_review", ~already_reviewed),
     )
     if dataset_id:
         query = query.where(DatasetItemModel.batch_id == dataset_id)
-    query = query.order_by(DatasetItemModel.created_at.asc()).limit(1).with_for_update(skip_locked=True)
+    query = query.order_by(
+        case((DatasetItemModel.status == "needs_review", 0), else_=queue_priority),
+        DatasetItemModel.created_at.asc(),
+    ).limit(1).with_for_update(skip_locked=True)
     result = await db.execute(query)
     item = result.scalar_one_or_none()
     if not item:
@@ -4427,43 +4777,68 @@ async def expert_annotate_item(
     review_required = (
         payload.action in {"skip", "review"}
         or payload.top_label in {"meteorite", "uncertain"}
-        or payload.confidence in {"low", "not_assessed"}
+        or payload.confidence != "high"
         or bool((item.quality_report or {}).get("issues"))
-        or len(annotations) < 2 and payload.top_label == "meteorite"
+        or _second_review_sample(item)
     )
+    consensus.training_eligible = False
+    consensus.final_confidence = None
     if len(annotations) >= 2:
-        first = annotations[0]
-        same = all(
-            annotation.top_label == first.top_label
-            and annotation.meteorite_subclass == first.meteorite_subclass
-            and annotation.terrestrial_family == first.terrestrial_family
+        signatures = Counter(
+            (
+                annotation.top_label,
+                annotation.meteorite_subclass,
+                annotation.terrestrial_family,
+            )
             for annotation in annotations
+            if annotation.confidence == "high"
         )
-        review_required = not same
-        if same:
-            consensus.final_label = first.top_label
-            consensus.meteorite_subclass = first.meteorite_subclass
-            consensus.terrestrial_family = first.terrestrial_family
+        winning_signature, votes = signatures.most_common(1)[0] if signatures else (None, 0)
+        if winning_signature and votes >= 2:
+            final_label, meteorite_subclass, terrestrial_family = winning_signature
+            consensus.final_label = final_label
+            consensus.meteorite_subclass = meteorite_subclass
+            consensus.terrestrial_family = terrestrial_family
             consensus.status = "consensus_validated"
             consensus.finalized_by = user.id
             consensus.finalized_at = now
-    elif not review_required and payload.action == "label":
+            consensus.final_confidence = "high"
+            consensus.training_eligible = bool(
+                final_label not in {"uncertain", "unusable"}
+                and not (item.quality_report or {}).get("issues")
+            )
+            review_required = False
+        else:
+            consensus.status = "needs_review"
+            consensus.final_label = None
+            consensus.meteorite_subclass = None
+            consensus.terrestrial_family = None
+            review_required = True
+    elif not review_required and payload.action == "label" and payload.confidence == "high":
         consensus.final_label = payload.top_label
         consensus.meteorite_subclass = payload.meteorite_subclass
         consensus.terrestrial_family = payload.terrestrial_family
         consensus.status = "consensus_validated"
         consensus.finalized_by = user.id
         consensus.finalized_at = now
+        consensus.final_confidence = "high"
+        consensus.training_eligible = bool(
+            payload.top_label not in {"uncertain", "unusable"}
+            and not (item.quality_report or {}).get("issues")
+        )
 
     if payload.action == "skip":
         item.status = "skipped"
         consensus.status = "skipped"
+        consensus.training_eligible = False
     elif payload.action == "unusable":
         item.status = "unusable"
         consensus.final_label = "unusable"
         consensus.status = "consensus_validated"
         consensus.finalized_by = user.id
         consensus.finalized_at = now
+        consensus.final_confidence = "not_assessed"
+        consensus.training_eligible = False
     elif consensus.status == "consensus_validated":
         item.status = "consensus_validated"
     else:
@@ -4482,6 +4857,107 @@ async def expert_annotate_item(
         annotation_id=event.id,
         consensus_status=consensus.status,
         review_required=review_required,
+        next_item_available=True,
+    )
+
+
+@app.post(
+    "/api/v1/expert/items/{item_id}/adjudicate",
+    response_model=ExpertAnnotationResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_adjudicate_item(
+    item_id: str,
+    payload: ExpertAdjudicationInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_dataset_admin(authorization, db)
+    item = await _dataset_item_for_id(item_id, db)
+    duplicate_result = await db.execute(
+        select(AnnotationEventModel).where(AnnotationEventModel.client_uuid == payload.client_uuid)
+    )
+    duplicate = duplicate_result.scalar_one_or_none()
+    if duplicate:
+        if duplicate.dataset_item_id != item.id:
+            raise AppProductionException("CONFLICT", "Cette décision a déjà été utilisée pour une autre image.", 409)
+        consensus_result = await db.execute(
+            select(DatasetConsensusModel).where(DatasetConsensusModel.dataset_item_id == item.id)
+        )
+        consensus = consensus_result.scalar_one_or_none()
+        return ExpertAnnotationResponse(
+            item=await _dataset_item_response(item, consensus),
+            annotation_id=duplicate.id,
+            consensus_status=consensus.status if consensus else "duplicate",
+            review_required=consensus.review_required if consensus else True,
+            next_item_available=True,
+        )
+    try:
+        validate_annotation(payload.top_label, payload.meteorite_subclass, payload.terrestrial_family)
+    except ValueError as exc:
+        raise AppProductionException("VALIDATION_ERROR", str(exc), 400)
+    now = _dataset_now()
+    consensus_result = await db.execute(
+        select(DatasetConsensusModel).where(DatasetConsensusModel.dataset_item_id == item.id)
+    )
+    consensus = consensus_result.scalar_one_or_none()
+    if not consensus:
+        consensus = DatasetConsensusModel(dataset_item_id=item.id, status="pending")
+        db.add(consensus)
+    event = AnnotationEventModel(
+        id=str(uuid.uuid4()),
+        dataset_item_id=item.id,
+        expert_id=user.id,
+        client_uuid=payload.client_uuid,
+        action="adjudicate",
+        top_label=payload.top_label,
+        meteorite_subclass=payload.meteorite_subclass,
+        terrestrial_family=payload.terrestrial_family,
+        confidence="high",
+        comment=payload.comment,
+        annotation_metadata={**payload.metadata, "specimen_id": payload.specimen_id, "adjudicated": True},
+        policy_version=ANNOTATION_POLICY_VERSION,
+        created_at=now,
+    )
+    db.add(event)
+    if payload.specimen_id is not None:
+        item.specimen_id = payload.specimen_id or None
+    if payload.metadata:
+        item.item_metadata = {**(item.item_metadata or {}), **payload.metadata}
+    consensus.final_label = payload.top_label
+    consensus.meteorite_subclass = payload.meteorite_subclass
+    consensus.terrestrial_family = payload.terrestrial_family
+    consensus.final_confidence = "high"
+    consensus.status = "consensus_validated"
+    consensus.review_required = False
+    consensus.training_eligible = bool(
+        payload.top_label not in {"uncertain", "unusable"}
+        and not (item.quality_report or {}).get("issues")
+    )
+    consensus.finalized_by = user.id
+    consensus.finalized_at = now
+    consensus.updated_at = now
+    item.status = "consensus_validated"
+    item.lease_user_id = None
+    item.lease_expires_at = None
+    item.updated_at = now
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="expert_annotation_adjudicated",
+        entity_type="dataset_item",
+        entity_id=item.id,
+        metadata={"dataset_id": item.batch_id, "final_label": payload.top_label},
+    )
+    await db.commit()
+    await db.refresh(item)
+    return ExpertAnnotationResponse(
+        item=await _dataset_item_response(item, consensus),
+        annotation_id=event.id,
+        consensus_status=consensus.status,
+        review_required=False,
         next_item_available=True,
     )
 
@@ -4539,6 +5015,26 @@ async def expert_create_audit(
     )
     rows = rows_result.all()
     summary, errors, recommendations = build_audit(rows)
+    pending_review_result = await db.execute(
+        select(func.count())
+        .select_from(DatasetConsensusModel)
+        .join(DatasetItemModel, DatasetConsensusModel.dataset_item_id == DatasetItemModel.id)
+        .where(
+            DatasetItemModel.batch_id == payload.dataset_id,
+            DatasetConsensusModel.status == "needs_review",
+        )
+    )
+    reviewed_rows = [consensus for _item, consensus in rows if consensus.annotation_count >= 2]
+    summary["human_review"] = {
+        "validated": sum(1 for _item, consensus in rows if consensus.status == "consensus_validated"),
+        "training_eligible": sum(1 for _item, consensus in rows if consensus.training_eligible),
+        "double_reviewed": len(reviewed_rows),
+        "agreement_rate": round(
+            sum(1 for consensus in reviewed_rows if consensus.status == "consensus_validated") / len(reviewed_rows),
+            6,
+        ) if reviewed_rows else None,
+        "needs_adjudication": int(pending_review_result.scalar_one() or 0),
+    }
     audit_id = str(uuid.uuid4())
     report_key = f"datasets/{payload.dataset_id}/reports/{audit_id}/summary.html"
     errors_key = f"datasets/{payload.dataset_id}/reports/{audit_id}/errors.csv"
@@ -4684,7 +5180,8 @@ async def expert_create_export(
 ):
     user, _subscription = await _require_dataset_admin(authorization, db)
     batch_result = await db.execute(select(DatasetBatchModel).where(DatasetBatchModel.id == payload.dataset_id))
-    if not batch_result.scalar_one_or_none():
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
         raise AppProductionException("NOT_FOUND", "Dataset introuvable.", 404)
     result = await db.execute(
         select(DatasetItemModel, DatasetConsensusModel)
@@ -4701,62 +5198,134 @@ async def expert_create_export(
 
     version = payload.version or f"v{_dataset_now().strftime('%Y%m%d%H%M%S')}"
     manifests: dict[str, list[dict]] = {"train": [], "validation": [], "test": []}
-    excluded: dict[str, list[dict]] = {"hard_cases": [], "unlabeled": []}
+    excluded: dict[str, list[dict]] = {
+        "hard_cases": [],
+        "unlabeled": [],
+        "not_training_eligible": [],
+    }
+    export_images: list[tuple[str, DatasetItemModel, dict]] = []
     for item, consensus in rows:
-        specimen_key = item.specimen_id or item.id
+        group_id = (
+            item.specimen_id
+            or str((item.item_metadata or {}).get("perceptual_duplicate_of") or item.id)
+        )
         entry = {
             "image_id": item.id,
-            "specimen_id": specimen_key,
-            "image_uri": item.normalized_object_key or item.original_object_key,
-            "sha256": item.sha256,
+            "group_id": group_id,
+            "specimen_id": item.specimen_id,
+            "source_sha256": item.sha256,
             "top_label": consensus.final_label,
             "meteorite_subclass": consensus.meteorite_subclass,
             "terrestrial_family": consensus.terrestrial_family,
-            "quality": (item.quality_report or {}).get("passed", True),
-            "annotation_status": consensus.status,
+            "human_confidence": consensus.final_confidence,
+            "quality_report": item.quality_report or {},
+            "consensus_status": consensus.status,
+            "training_eligible": consensus.training_eligible,
             "model_version": item.model_version,
-            "taxonomy_version": TAXONOMY_VERSION,
+            "vision_trio": item.raw_prediction or {},
+            "taxonomy_version": batch.taxonomy_version,
+            "annotation_policy_version": batch.annotation_policy_version,
         }
         if consensus.final_label in {"uncertain", "unusable"}:
             entry["split"] = "unlabeled"
             excluded["unlabeled"].append(entry)
             continue
-        if not entry["quality"]:
+        if not (item.quality_report or {}).get("passed", True):
             entry["split"] = "hard_cases"
             excluded["hard_cases"].append(entry)
             continue
-        split_hash = int(hashlib.sha256(specimen_key.encode("utf-8")).hexdigest()[:8], 16) % 100
-        split = "train" if split_hash < 80 else "validation" if split_hash < 90 else "test"
+        if not consensus.training_eligible:
+            entry["split"] = "not_training_eligible"
+            excluded["not_training_eligible"].append(entry)
+            continue
+        split = deterministic_group_split(group_id)
         entry["split"] = split
+        entry["image_path"] = f"images/{split}/{item.id}.jpg"
         manifests[split].append(entry)
+        export_images.append((split, item, entry))
 
-    export_id = str(uuid.uuid4())
-    base_key = f"datasets/{payload.dataset_id}/exports/{version}"
     supervised_manifest = [entry for split in ("train", "validation", "test") for entry in manifests[split]]
-    manifest = [*supervised_manifest, *excluded["hard_cases"], *excluded["unlabeled"]]
-    await storage_provider.save_object(
-        ("\n".join(json.dumps(item, ensure_ascii=False) for item in manifest) + "\n").encode("utf-8"),
-        f"{base_key}/manifest.jsonl",
-        "application/jsonl",
-    )
-    for split, entries in manifests.items():
-        await storage_provider.save_object(
-            ("\n".join(json.dumps(item, ensure_ascii=False) for item in entries) + "\n").encode("utf-8"),
-            f"{base_key}/{split}.jsonl",
-            "application/jsonl",
-        )
-    for split, entries in excluded.items():
-        await storage_provider.save_object(
-            ("\n".join(json.dumps(item, ensure_ascii=False) for item in entries) + "\n").encode("utf-8"),
-            f"{base_key}/{split}.jsonl",
-            "application/jsonl",
-        )
+    if not supervised_manifest:
+        raise AppProductionException("CONFLICT", "Aucune image validée à haute confiance à exporter.", 409)
+    manifest = [*supervised_manifest, *excluded["hard_cases"], *excluded["unlabeled"], *excluded["not_training_eligible"]]
     statistics = {
         "total": len(manifest),
         "supervised_total": len(supervised_manifest),
         **{split: len(entries) for split, entries in manifests.items()},
         **{split: len(entries) for split, entries in excluded.items()},
+        "split_policy": "grouped-deterministic-70-15-15",
     }
+    export_id = str(uuid.uuid4())
+    base_key = f"datasets/{payload.dataset_id}/exports/{version}"
+    manifest_content = ("\n".join(json.dumps(entry, ensure_ascii=False) for entry in manifest) + "\n").encode("utf-8")
+    await storage_provider.save_object(manifest_content, f"{base_key}/manifest.jsonl", "application/jsonl")
+    for split, entries in manifests.items():
+        await storage_provider.save_object(
+            ("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n").encode("utf-8"),
+            f"{base_key}/{split}.jsonl",
+            "application/jsonl",
+        )
+    for split, entries in excluded.items():
+        await storage_provider.save_object(
+            ("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n").encode("utf-8"),
+            f"{base_key}/{split}.jsonl",
+            "application/jsonl",
+        )
+
+    archive_buffer = io.BytesIO()
+    checksums: list[str] = []
+    with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for _split, item, entry in export_images:
+            image_bytes = await storage_provider.get_object(item.normalized_object_key or item.original_object_key)
+            archive.writestr(entry["image_path"], image_bytes)
+            entry["image_sha256"] = hashlib.sha256(image_bytes).hexdigest()
+            checksums.append(f"{entry['image_sha256']}  {entry['image_path']}")
+        archive.writestr("manifest.jsonl", "\n".join(json.dumps(entry, ensure_ascii=False) for entry in manifest) + "\n")
+        for split, entries in manifests.items():
+            archive.writestr(f"{split}.jsonl", "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n")
+        for split, entries in excluded.items():
+            archive.writestr(f"{split}.jsonl", "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n")
+        csv_buffer = io.StringIO()
+        fieldnames = [
+            "image_id", "group_id", "specimen_id", "image_path", "image_sha256", "source_sha256",
+            "split", "top_label", "meteorite_subclass", "terrestrial_family", "human_confidence",
+            "consensus_status", "training_eligible", "model_version", "taxonomy_version", "annotation_policy_version",
+        ]
+        writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(manifest)
+        archive.writestr("annotations.csv", csv_buffer.getvalue())
+        archive.writestr("taxonomy.json", json.dumps({
+            "version": batch.taxonomy_version,
+            "top_labels": sorted({"meteorite", "terrestrial_rock", "uncertain", "unusable", "non_rock"}),
+            "meteorite_subclasses": sorted(METEORITE_SUBCLASSES),
+            "terrestrial_families": sorted(TERRESTRIAL_FAMILIES),
+        }, ensure_ascii=False, indent=2))
+        archive.writestr("checksums.sha256", "\n".join(checksums) + "\n")
+        archive.writestr("dataset-card.md", "\n".join([
+            f"# {batch.name}",
+            "",
+            f"Version: {version}",
+            f"Model source: {MODEL_VERSION}",
+            f"Taxonomy: {batch.taxonomy_version}",
+            f"Annotation policy: {batch.annotation_policy_version}",
+            "Split: deterministic 70/15/15 by specimen or perceptual-duplicate group.",
+            "Only high-confidence, human-validated labels are included in train, validation and test.",
+            json.dumps(statistics, ensure_ascii=False, indent=2),
+        ]))
+    await storage_provider.save_object(
+        ("\n".join(json.dumps(entry, ensure_ascii=False) for entry in manifest) + "\n").encode("utf-8"),
+        f"{base_key}/manifest.jsonl",
+        "application/jsonl",
+    )
+    for split, entries in manifests.items():
+        await storage_provider.save_object(
+            ("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n").encode("utf-8"),
+            f"{base_key}/{split}.jsonl",
+            "application/jsonl",
+        )
+    archive_key = f"{base_key}/dataset-{version}.zip"
+    await storage_provider.save_object(archive_buffer.getvalue(), archive_key, "application/zip")
     export = DatasetExportModel(
         id=export_id,
         batch_id=payload.dataset_id,
@@ -4764,10 +5333,19 @@ async def expert_create_export(
         status="completed",
         created_by=user.id,
         manifest_object_key=f"{base_key}/manifest.jsonl",
+        archive_object_key=archive_key,
         statistics=statistics,
         created_at=_dataset_now(),
     )
     db.add(export)
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="expert_dataset_exported",
+        entity_type="dataset_export",
+        entity_id=export.id,
+        metadata={"dataset_id": payload.dataset_id, "version": version, "statistics": statistics},
+    )
     await db.commit()
     return ExpertExportResponse(
         id=export.id,
@@ -4776,6 +5354,7 @@ async def expert_create_export(
         status=export.status,
         statistics=statistics,
         manifest_url=await _dataset_object_url(export.manifest_object_key),
+        download_url=await _dataset_object_url(export.archive_object_key),
         created_at=export.created_at.isoformat(),
     )
 
@@ -4805,6 +5384,7 @@ async def expert_list_exports(
             status=export.status,
             statistics=export.statistics or {},
             manifest_url=await _dataset_object_url(export.manifest_object_key),
+            download_url=await _dataset_object_url(export.archive_object_key),
             created_at=export.created_at.isoformat(),
         )
         for export in result.scalars().all()
@@ -4835,6 +5415,7 @@ async def expert_get_export(
         status=export.status,
         statistics=export.statistics or {},
         manifest_url=await _dataset_object_url(export.manifest_object_key),
+        download_url=await _dataset_object_url(export.archive_object_key),
         created_at=export.created_at.isoformat(),
     )
 
@@ -4859,6 +5440,7 @@ async def expert_download_export(
         "export_id": export.id,
         "version": export.version,
         "manifest_url": await _dataset_object_url(export.manifest_object_key),
+        "download_url": await _dataset_object_url(export.archive_object_key),
         "statistics": export.statistics or {},
         "taxonomy_version": TAXONOMY_VERSION,
         "dataset_version": export.batch_id,

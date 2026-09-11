@@ -293,6 +293,20 @@ class DatasetBatchModel(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
+class DatasetImportModel(Base):
+    __tablename__ = "dataset_imports"
+
+    id = Column(String, primary_key=True, index=True)
+    batch_id = Column(String, ForeignKey("dataset_batches.id"), index=True, nullable=False)
+    name = Column(String, nullable=False)
+    source_attested = Column(Boolean, nullable=False, default=False)
+    status = Column(String, nullable=False, default="uploading")
+    created_by = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    statistics = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
 class DatasetItemModel(Base):
     __tablename__ = "dataset_items"
     __table_args__ = (
@@ -301,6 +315,7 @@ class DatasetItemModel(Base):
 
     id = Column(String, primary_key=True, index=True)
     batch_id = Column(String, ForeignKey("dataset_batches.id"), index=True, nullable=False)
+    import_id = Column(String, ForeignKey("dataset_imports.id"), index=True, nullable=True)
     specimen_id = Column(String, index=True, nullable=True)
     original_filename = Column(String, nullable=True)
     content_type = Column(String, nullable=False, default="image/jpeg")
@@ -350,6 +365,8 @@ class DatasetConsensusModel(Base):
     terrestrial_family = Column(String, nullable=True)
     status = Column(String, nullable=False, default="pending")
     review_required = Column(Boolean, nullable=False, default=False)
+    training_eligible = Column(Boolean, nullable=False, default=False)
+    final_confidence = Column(String, nullable=True)
     annotation_count = Column(Integer, nullable=False, default=0)
     finalized_by = Column(String, ForeignKey("users.id"), nullable=True)
     finalized_at = Column(DateTime, nullable=True)
@@ -381,6 +398,7 @@ class DatasetExportModel(Base):
     status = Column(String, nullable=False, default="completed")
     created_by = Column(String, ForeignKey("users.id"), index=True, nullable=False)
     manifest_object_key = Column(String, nullable=True)
+    archive_object_key = Column(String, nullable=True)
     statistics = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
