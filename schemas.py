@@ -544,6 +544,11 @@ class ExpertDatasetResponse(BaseModel):
 class ExpertImportCreateInput(BaseModel):
     name: str = Field(..., min_length=1, max_length=160)
     source_attested: bool = False
+    source_type: str = Field("other", max_length=80)
+    source_reference: Optional[str] = Field(None, max_length=500)
+    rights_status: str = Field("attested", max_length=80)
+    evidence_tier: str = Field("unresolved", max_length=80)
+    view_type: str = Field("unknown", max_length=80)
 
 
 class ExpertImportResponse(BaseModel):
@@ -552,6 +557,11 @@ class ExpertImportResponse(BaseModel):
     name: str
     status: str
     source_attested: bool
+    source_type: str = "other"
+    source_reference: Optional[str] = None
+    rights_status: str = "attested"
+    evidence_tier: str = "unresolved"
+    view_type: str = "unknown"
     statistics: dict = Field(default_factory=dict)
     created_at: str
     updated_at: str
@@ -639,12 +649,15 @@ class ExpertQueueItemResponse(BaseModel):
 class ExpertAnnotationInput(BaseModel):
     client_uuid: str = Field(..., min_length=8, max_length=120)
     action: Literal["label", "skip", "unusable", "review"]
-    top_label: Optional[Literal["meteorite", "terrestrial_rock", "uncertain", "unusable", "non_rock"]] = None
+    top_label: Optional[str] = Field(None, max_length=80)
     meteorite_subclass: Optional[str] = Field(None, max_length=100)
     terrestrial_family: Optional[str] = Field(None, max_length=100)
     confidence: Optional[Literal["high", "medium", "low", "not_assessed"]] = None
     comment: Optional[str] = Field(None, max_length=2000)
     specimen_id: Optional[str] = Field(None, max_length=160)
+    evidence_tier: Optional[str] = Field(None, max_length=80)
+    reason_codes: List[str] = Field(default_factory=list, max_length=20)
+    requested_evidence: List[str] = Field(default_factory=list, max_length=20)
     metadata: dict = Field(default_factory=dict)
 
 
@@ -662,7 +675,7 @@ class ExpertAnnotationResponse(BaseModel):
 
 class ExpertAdjudicationInput(BaseModel):
     client_uuid: str = Field(..., min_length=8, max_length=120)
-    top_label: Literal["meteorite", "terrestrial_rock", "uncertain", "unusable", "non_rock"]
+    top_label: str = Field(..., max_length=80)
     meteorite_subclass: Optional[str] = Field(None, max_length=100)
     terrestrial_family: Optional[str] = Field(None, max_length=100)
     confidence: Literal["high"] = "high"

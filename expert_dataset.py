@@ -11,6 +11,45 @@ from PIL import Image, ImageOps
 TAXONOMY_VERSION = "taxonomy-v1"
 ANNOTATION_POLICY_VERSION = "annotation-policy-v1"
 MODEL_VERSION = "trio-v1"
+
+# v1 remains frozen for the original expert workflow.  v2 is deliberately
+# separate: it is the data contract used by the reproducible fine-tuning repo.
+TAXONOMY_V2_VERSION = "taxonomy-v2"
+ANNOTATION_POLICY_V2_VERSION = "annotation-policy-v2"
+VISION_V2_DATASET_CONTRACT_VERSION = "trio-finetune-v2"
+VISION_V2_RELEASE_CONTRACT_VERSION = "trio-vision-release-v2"
+V2_PRIMARY_VERDICTS = {
+    "terrestrial",
+    "meteorite_candidate",
+    "uncertain",
+    "unusable",
+    "non_specimen",
+}
+V2_EVIDENCE_TIERS = {
+    "catalog_verified",
+    "field_expert_single",
+    "field_expert_audited",
+    "historical_unreviewed",
+    "unresolved",
+}
+V2_SOURCE_TYPES = {
+    "catalog",
+    "facebook_group",
+    "pwa_scan",
+    "field_collection",
+    "mindat_negative",
+    "legacy_training",
+    "other",
+}
+V2_VIEW_TYPES = {"unknown", "exterior", "interior", "multiple", "non_specimen"}
+V2_TRAINING_ROLES = {
+    "gold",
+    "field_strong",
+    "weak_labels",
+    "hard_negatives",
+    "unresolved",
+    "unusable",
+}
 POSITIVE_THRESHOLD = 0.80
 UNCERTAIN_THRESHOLD = 0.50
 
@@ -192,6 +231,77 @@ def validate_annotation(top_label: str | None, meteorite_subclass: str | None, t
     else:
         if meteorite_subclass is not None or terrestrial_family is not None:
             raise ValueError("Une annotation incertaine ou inutilisable ne peut pas contenir de sous-classe")
+
+
+def validate_v2_annotation(
+    verdict: str | None,
+    meteorite_subclass: str | None,
+    terrestrial_family: str | None,
+    evidence_tier: str | None,
+) -> None:
+    """Validate a v2 human observation without forcing a speculative subclass."""
+    if verdict not in V2_PRIMARY_VERDICTS:
+        raise ValueError("Le verdict v2 est invalide")
+    if evidence_tier not in V2_EVIDENCE_TIERS:
+        raise ValueError("Le niveau de preuve v2 est invalide")
+    if meteorite_subclass and meteorite_subclass not in METEORITE_SUBCLASSES:
+        raise ValueError("La sous-classe météoritique est invalide")
+    if terrestrial_family and terrestrial_family not in TERRESTRIAL_FAMILIES:
+        raise ValueError("La famille terrestre est invalide")
+    if meteorite_subclass and terrestrial_family:
+        raise ValueError("Une image ne peut pas être à la fois sous-classe météoritique et famille terrestre")
+    if verdict != "meteorite_candidate" and meteorite_subclass:
+        raise ValueError("Une sous-classe météoritique exige un candidat météoritique")
+    if verdict != "terrestrial" and terrestrial_family:
+        raise ValueError("Une famille terrestre exige un verdict terrestre")
+
+
+def v2_training_role(
+    *,
+    verdict: str | None,
+    evidence_tier: str | None,
+    confidence: str | None,
+    quality_passed: bool,
+    audit_status: str,
+    source_type: str | None,
+) -> str:
+    """Assign a conservative dataset partition; only reference labels reach val/test."""
+    if verdict == "unusable" or not quality_passed:
+        return "unusable"
+    if verdict in {None, "uncertain", "non_specimen"} or audit_status in {"conflict", "pending"}:
+        return "unresolved"
+    if evidence_tier == "catalog_verified" and audit_status in {"audited", "not_required"}:
+        return "hard_negatives" if verdict == "terrestrial" else "gold"
+    if evidence_tier == "field_expert_audited" and confidence == "high":
+        return "field_strong"
+    if (
+        source_type == "facebook_group"
+        and evidence_tier == "field_expert_single"
+        and confidence in {"high", "medium"}
+    ):
+        return "weak_labels"
+    return "unresolved"
+
+
+def v2_stratified_group_split(groups: dict[str, str]) -> dict[str, str]:
+    """Deterministic, label-stratified group allocation for immutable v2 snapshots."""
+    targets = {"train": 0.70, "validation": 0.15, "test": 0.15}
+    by_label: dict[str, list[str]] = defaultdict(list)
+    for group_id, label in groups.items():
+        by_label[label or "unknown"].append(group_id)
+    assignments: dict[str, str] = {}
+    for label, group_ids in by_label.items():
+        ordered = sorted(group_ids, key=lambda value: hashlib.sha256(f"v2:{label}:{value}".encode()).hexdigest())
+        counts = {split: 0 for split in targets}
+        for group_id in ordered:
+            total = sum(counts.values())
+            split = min(
+                targets,
+                key=lambda candidate: (counts[candidate] / max(1, total + 1) - targets[candidate], candidate),
+            )
+            assignments[group_id] = split
+            counts[split] += 1
+    return assignments
 
 
 def build_audit(rows: list[tuple[Any, Any]]) -> tuple[dict, list[dict], list[str]]:
