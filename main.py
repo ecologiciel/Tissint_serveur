@@ -86,6 +86,7 @@ from schemas import (
     ExpertDatasetResponse,
     ExpertDatasetStatsResponse,
     ExpertImportCreateInput,
+    ExpertImportMetadataUpdateInput,
     ExpertImportResponse,
     ExpertRoleUpdateInput,
     ExpertUserResponse,
@@ -4552,6 +4553,96 @@ async def expert_list_imports(
         .order_by(DatasetImportModel.created_at.desc())
     )
     return [await _import_response(row, db) for row in result.scalars().all()]
+
+
+@app.patch(
+    "/api/v1/expert/imports/{import_id}/metadata",
+    response_model=ExpertImportResponse,
+    status_code=status.HTTP_200_OK,
+    responses=ERROR_RESPONSES,
+)
+async def expert_update_import_metadata(
+    import_id: str,
+    payload: ExpertImportMetadataUpdateInput,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
+    user, _subscription = await _require_dataset_admin(authorization, db)
+    import_row = await db.get(DatasetImportModel, import_id)
+    if not import_row:
+        raise AppProductionException("NOT_FOUND", "Lot d'import introuvable.", 404)
+    batch = await db.get(DatasetBatchModel, import_row.batch_id)
+    if not batch or not _is_v2_dataset(batch):
+        raise AppProductionException("VALIDATION_ERROR", "Seuls les lots taxonomy-v2 peuvent être corrigés.", 400)
+    if (
+        payload.source_type not in V2_SOURCE_TYPES
+        or payload.evidence_tier not in V2_EVIDENCE_TIERS
+        or payload.view_type not in V2_VIEW_TYPES
+    ):
+        raise AppProductionException("VALIDATION_ERROR", "Métadonnées v2 d'import invalides.", 400)
+
+    items_result = await db.execute(
+        select(DatasetItemModel).where(DatasetItemModel.import_id == import_id)
+    )
+    items = items_result.scalars().all()
+    if items:
+        annotation_result = await db.execute(
+            select(AnnotationEventModel.id)
+            .where(AnnotationEventModel.dataset_item_id.in_([item.id for item in items]))
+            .limit(1)
+        )
+        if annotation_result.scalar_one_or_none():
+            raise AppProductionException(
+                "CONFLICT",
+                "Les métadonnées ne peuvent plus être modifiées après la première annotation.",
+                409,
+            )
+
+    previous = {
+        "source_type": import_row.source_type,
+        "source_reference": import_row.source_reference,
+        "rights_status": import_row.rights_status,
+        "evidence_tier": import_row.evidence_tier,
+        "view_type": import_row.view_type,
+    }
+    import_row.source_type = payload.source_type
+    import_row.source_reference = payload.source_reference.strip() if payload.source_reference else None
+    import_row.rights_status = payload.rights_status
+    import_row.evidence_tier = payload.evidence_tier
+    import_row.view_type = payload.view_type
+    now = _dataset_now()
+    import_row.updated_at = now
+    for item in items:
+        item.source_type = import_row.source_type
+        item.source_reference = import_row.source_reference
+        item.rights_status = import_row.rights_status
+        item.evidence_tier = import_row.evidence_tier
+        item.view_type = import_row.view_type
+        item.item_metadata = {
+            **(item.item_metadata or {}),
+            "source_type": import_row.source_type,
+            "source_reference": import_row.source_reference,
+            "origin": import_row.source_type,
+            "capture_type": import_row.view_type,
+        }
+        item.updated_at = now
+    await _write_audit_log(
+        db,
+        actor_user_id=user.id,
+        action="expert_import_metadata_corrected",
+        entity_type="dataset_import",
+        entity_id=import_row.id,
+        metadata={"dataset_id": import_row.batch_id, "previous": previous, "next": {
+            "source_type": import_row.source_type,
+            "source_reference": import_row.source_reference,
+            "rights_status": import_row.rights_status,
+            "evidence_tier": import_row.evidence_tier,
+            "view_type": import_row.view_type,
+        }, "affected_items": len(items)},
+    )
+    await db.commit()
+    return await _import_response(import_row, db)
 
 
 @app.post(

@@ -551,6 +551,14 @@ class ExpertImportCreateInput(BaseModel):
     view_type: str = Field("unknown", max_length=80)
 
 
+class ExpertImportMetadataUpdateInput(BaseModel):
+    source_type: str = Field(..., max_length=80)
+    source_reference: Optional[str] = Field(None, max_length=500)
+    rights_status: str = Field("attested", max_length=80)
+    evidence_tier: str = Field(..., max_length=80)
+    view_type: str = Field(..., max_length=80)
+
+
 class ExpertImportResponse(BaseModel):
     id: str
     dataset_id: str
