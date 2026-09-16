@@ -3841,6 +3841,7 @@ DATASET_ALLOWED_CONTENT_TYPES = {
 DATASET_MAX_FILE_SIZE_BYTES = int(os.getenv("DATASET_MAX_FILE_SIZE_BYTES", str(20 * 1024 * 1024)))
 DATASET_LEASE_MINUTES = int(os.getenv("DATASET_LEASE_MINUTES", "15"))
 V2_AUDIT_DELAY_HOURS = int(os.getenv("EXPERT_V2_AUDIT_DELAY_HOURS", "72"))
+EXPERT_QUEUE_AVAILABLE_STATUSES = {"pending_annotation", "needs_review", "audit_pending", "inference_ready"}
 
 
 def _dataset_now() -> datetime:
@@ -3905,6 +3906,28 @@ def _second_review_sample(item: DatasetItemModel) -> bool:
 def _v2_audit_sample(item: DatasetItemModel) -> bool:
     seed = item.sha256 or item.id
     return int(hashlib.sha256(f"audit-v2:{seed}".encode("utf-8")).hexdigest()[:8], 16) % 100 < 15
+
+
+def _restore_released_dataset_item(item: DatasetItemModel) -> None:
+    """Return an abandoned lease to its exact queue stage whenever possible."""
+    metadata = dict(item.item_metadata or {})
+    previous_status = str(metadata.pop("lease_previous_status", ""))
+    if item.status == "audit_in_progress":
+        item.status = "audit_pending"
+    elif previous_status in EXPERT_QUEUE_AVAILABLE_STATUSES:
+        item.status = previous_status
+    else:
+        # Older leases did not record their prior state; all inference-complete imports start here.
+        item.status = "pending_annotation"
+    item.item_metadata = metadata
+    item.lease_user_id = None
+    item.lease_expires_at = None
+
+
+def _clear_dataset_lease_metadata(item: DatasetItemModel) -> None:
+    metadata = dict(item.item_metadata or {})
+    metadata.pop("lease_previous_status", None)
+    item.item_metadata = metadata
 
 
 def _queue_reason(item: DatasetItemModel) -> str:
@@ -4973,7 +4996,29 @@ async def expert_queue_next(
 ):
     user, _subscription = await _require_expert_context(authorization, db)
     now = _dataset_now()
-    available_statuses = {"pending_annotation", "needs_review", "audit_pending", "inference_ready"}
+    active_leases = select(DatasetItemModel).where(
+        DatasetItemModel.lease_user_id == user.id,
+        DatasetItemModel.lease_expires_at > now,
+        DatasetItemModel.status.in_({"in_progress", "audit_in_progress"}),
+    )
+    if dataset_id:
+        active_leases = active_leases.where(DatasetItemModel.batch_id == dataset_id)
+    active_leases = active_leases.order_by(DatasetItemModel.updated_at.desc()).with_for_update(skip_locked=True)
+    active_result = await db.execute(active_leases)
+    leased_items = list(active_result.scalars().all())
+    if leased_items:
+        # A reload must resume the current task. Clean up only abandoned extra leases
+        # created by the former refresh bug, retaining the most recently opened one.
+        item = leased_items[0]
+        for abandoned_item in leased_items[1:]:
+            _restore_released_dataset_item(abandoned_item)
+            abandoned_item.updated_at = now
+        item.lease_expires_at = now + timedelta(minutes=DATASET_LEASE_MINUTES)
+        item.updated_at = now
+        await db.commit()
+        await db.refresh(item)
+        return await _dataset_item_response(item)
+
     already_reviewed = (
         select(AnnotationEventModel.id)
         .where(
@@ -4988,7 +5033,7 @@ async def expert_queue_next(
         99,
     )
     query = select(DatasetItemModel).where(
-        DatasetItemModel.status.in_(available_statuses),
+        DatasetItemModel.status.in_(EXPERT_QUEUE_AVAILABLE_STATUSES),
         or_(DatasetItemModel.lease_expires_at.is_(None), DatasetItemModel.lease_expires_at < now),
         or_(DatasetItemModel.status.notin_(["needs_review"]), ~already_reviewed),
         or_(DatasetItemModel.audit_not_before.is_(None), DatasetItemModel.audit_not_before <= now),
@@ -5003,6 +5048,10 @@ async def expert_queue_next(
     item = result.scalar_one_or_none()
     if not item:
         return None
+    item.item_metadata = {
+        **(item.item_metadata or {}),
+        "lease_previous_status": item.status,
+    }
     item.status = "audit_in_progress" if item.status == "audit_pending" else "in_progress"
     item.lease_user_id = user.id
     item.lease_expires_at = now + timedelta(minutes=DATASET_LEASE_MINUTES)
@@ -5217,6 +5266,7 @@ async def _annotate_v2_item(
     consensus.updated_at = now
     item.lease_user_id = None
     item.lease_expires_at = None
+    _clear_dataset_lease_metadata(item)
     item.updated_at = now
     await db.commit()
     await db.refresh(item)
@@ -5393,6 +5443,7 @@ async def expert_annotate_item(
     consensus.updated_at = now
     item.lease_user_id = None
     item.lease_expires_at = None
+    _clear_dataset_lease_metadata(item)
     item.updated_at = now
     await db.commit()
     await db.refresh(item)
@@ -5490,6 +5541,7 @@ async def expert_adjudicate_item(
         item.status = "consensus_validated"
         item.lease_user_id = None
         item.lease_expires_at = None
+        _clear_dataset_lease_metadata(item)
         item.updated_at = now
         await _write_audit_log(
             db, actor_user_id=user.id, action="expert_v2_annotation_arbitrated",
@@ -5550,6 +5602,7 @@ async def expert_adjudicate_item(
     item.status = "consensus_validated"
     item.lease_user_id = None
     item.lease_expires_at = None
+    _clear_dataset_lease_metadata(item)
     item.updated_at = now
     await _write_audit_log(
         db,
@@ -5586,12 +5639,7 @@ async def expert_release_item(
     item = await _dataset_item_for_id(item_id, db)
     if item.lease_user_id not in {None, user.id} and user.role != "admin":
         raise AppProductionException("FORBIDDEN", "Cette image appartient à un autre expert.", 403)
-    item.lease_user_id = None
-    item.lease_expires_at = None
-    if item.status == "audit_in_progress":
-        item.status = "audit_pending"
-    elif item.status == "in_progress":
-        item.status = "needs_review" if item.raw_prediction else "inference_pending"
+    _restore_released_dataset_item(item)
     item.updated_at = _dataset_now()
     await db.commit()
     await db.refresh(item)
