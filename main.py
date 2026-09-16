@@ -3882,6 +3882,11 @@ def _v2_item_metadata(item: DatasetItemModel) -> dict:
     }
 
 
+def _expert_image_quality(item: DatasetItemModel) -> str:
+    quality = str((item.item_metadata or {}).get("expert_image_quality") or "unknown")
+    return quality if quality in {"good", "fair", "poor"} else "unknown"
+
+
 def _normalize_dataset_image(data: bytes) -> tuple[bytes, bytes, dict]:
     return normalize_image_assets(data)
 
@@ -5150,6 +5155,7 @@ async def _annotate_v2_item(
                 quality_passed=bool((item.quality_report or {}).get("passed", True)),
                 audit_status="audited",
                 source_type=item.source_type,
+                human_image_quality=_expert_image_quality(item),
             )
             consensus.training_eligible = consensus.training_role in {
                 "gold", "field_strong", "weak_labels", "hard_negatives",
@@ -5195,6 +5201,7 @@ async def _annotate_v2_item(
                 quality_passed=bool((item.quality_report or {}).get("passed", True)),
                 audit_status="not_required",
                 source_type=item.source_type,
+                human_image_quality=_expert_image_quality(item),
             )
             consensus.training_eligible = consensus.training_role == "weak_labels"
             consensus.finalized_by = user.id
@@ -5470,6 +5477,7 @@ async def expert_adjudicate_item(
             verdict=payload.top_label, evidence_tier=final_evidence, confidence="high",
             quality_passed=bool((item.quality_report or {}).get("passed", True)),
             audit_status="audited", source_type=item.source_type,
+            human_image_quality=_expert_image_quality(item),
         )
         consensus.training_eligible = consensus.training_role in {"gold", "field_strong", "weak_labels", "hard_negatives"}
         consensus.subclass_eligible = bool(
@@ -5814,6 +5822,7 @@ async def _create_v2_export_snapshot(
         split_eligible = role in {"gold", "hard_negatives"} and verdict in {"meteorite_candidate", "terrestrial"}
         if split_eligible:
             group_labels.setdefault(group_id, "candidate" if verdict == "meteorite_candidate" else "terrestrial")
+        human_image_quality = _expert_image_quality(item)
         entry = {
             "image_id": item.id,
             "specimen_id": item.specimen_id,
@@ -5826,6 +5835,7 @@ async def _create_v2_export_snapshot(
             "rights_status": item.rights_status,
             "view_type": item.view_type,
             "quality_report": item.quality_report or {},
+            "human_image_quality": human_image_quality,
             "human_verdict": verdict,
             "meteorite_subclass": consensus.meteorite_subclass if consensus else None,
             "terrestrial_family": consensus.terrestrial_family if consensus else None,
@@ -5839,7 +5849,7 @@ async def _create_v2_export_snapshot(
             "vision_trio_raw": item.raw_prediction or {},
             "vision_trio_model_version": item.model_version,
             "training_tasks": {
-                "image_quality": role not in {"unresolved", "unusable"},
+                "image_quality": human_image_quality in {"good", "fair", "poor"},
                 "candidate_binary": role in {"gold", "field_strong", "weak_labels", "hard_negatives"},
                 "terrestrial_family": bool(consensus and consensus.terrestrial_family and role in {"gold", "field_strong", "hard_negatives"}),
                 "meteorite_subclass": bool(consensus and consensus.subclass_eligible),
@@ -5893,6 +5903,7 @@ async def _create_v2_export_snapshot(
                 "reason_codes": event.reason_codes or [],
                 "requested_evidence": event.requested_evidence or [],
                 "is_blind": event.is_blind,
+                "human_image_quality": str((event.annotation_metadata or {}).get("expert_image_quality") or "unknown"),
                 "policy_version": event.policy_version,
             })
 

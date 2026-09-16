@@ -264,9 +264,10 @@ def v2_training_role(
     quality_passed: bool,
     audit_status: str,
     source_type: str | None,
+    human_image_quality: str | None = None,
 ) -> str:
     """Assign a conservative dataset partition; only reference labels reach val/test."""
-    if verdict == "unusable" or not quality_passed:
+    if verdict == "unusable" or not quality_passed or human_image_quality == "poor":
         return "unusable"
     if verdict in {None, "uncertain", "non_specimen"} or audit_status in {"conflict", "pending"}:
         return "unresolved"

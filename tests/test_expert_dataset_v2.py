@@ -32,6 +32,18 @@ def test_weak_facebook_label_is_train_only_role():
     ) == "weak_labels"
 
 
+def test_poor_human_quality_is_excluded_from_candidate_training():
+    assert v2_training_role(
+        verdict="terrestrial",
+        evidence_tier="catalog_verified",
+        confidence="high",
+        quality_passed=True,
+        audit_status="audited",
+        source_type="catalog",
+        human_image_quality="poor",
+    ) == "unusable"
+
+
 def test_catalogue_reference_requires_a_non_uncertain_label():
     assert v2_training_role(
         verdict="uncertain",
